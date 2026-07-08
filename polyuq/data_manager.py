@@ -37,6 +37,9 @@ def _get_seaborn():
 
 
 def _get_ray():
+    # Import ray lazily and only after numpy/scipy/matplotlib are already loaded.
+    # Ray's native deps can fail with "cannot allocate memory in static TLS block"
+    # if imported before other C-extension libraries. See history: oma_uq ee3f8db.
     try:
         import ray
         return ray
@@ -467,7 +470,7 @@ class DataManager(object):
                 address = open(os.path.expanduser('~/ipaddress.txt'), 'rt').read().splitlines()[0] + ':6379'
             else:
                 address = 'auto'
-            ray.init(address=address, _redis_password='5241590000000000')
+            ray.init(address=address)
             self.futures = []
 
         elif not distributed:

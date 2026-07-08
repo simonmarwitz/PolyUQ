@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: PolyUQ
+abstract: >-
+  Polymorphic Uncertainty Quantification for Operational Modal Analysis.
+  Propagates mixed aleatory/epistemic uncertainty — random variables,
+  intervals, and Dempster-Shafer evidence — through arbitrary mapping
+  functions, and post-processes results into imprecision (belief /
+  plausibility) and incompleteness bounds. The methodology was developed
+  from 2022 within the oma_uq research repository; see CHANGELOG.md for
+  development history.
+authors:
+  - family-names: Marwitz
+    given-names: Simon
+  - family-names: Zabel
+    given-names: Volkmar
+version: 0.1.0a1
+date-released: "2026-07-08"
+license: GPL-3.0
+repository-code: "https://github.com/simonmarwitz/PolyUQ"
+url: "https://github.com/simonmarwitz/PolyUQ"
+keywords:
+  - uncertainty quantification
+  - imprecise probabilities
+  - Dempster-Shafer
+  - evidence theory
+  - operational modal analysis
+  - structural health monitoring

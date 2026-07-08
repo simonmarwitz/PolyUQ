@@ -41,6 +41,14 @@ walkthroughs. The companion repository
 operational modal analysis case study, using data published at
 [DOI 10.71758/refodat.46](https://doi.org/10.71758/refodat.46).
 
+## History
+
+The polymorphic UQ methodology implemented here dates to 2022, developed
+within the `oma_uq` research repository before being extracted as the
+standalone `polyuq` package in 2025. See [CHANGELOG.md](CHANGELOG.md) for
+the development timeline and [CITATION.cff](CITATION.cff) for citation
+information.
+
 ## License
 
 GPL v3, see [LICENSE](LICENSE).

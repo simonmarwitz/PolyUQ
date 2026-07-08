@@ -236,3 +236,20 @@ class TestAnalyticalMapping:
         )
         # Ice increases mass → frequencies decrease
         assert np.all(fd_ice <= fd_no_ice + 1e-6)
+
+
+class TestDataManagerImportOrder:
+    """Guards the static-TLS import-order constraint (see oma_uq history ee3f8db):
+    ray must never be imported before numpy/scipy/matplotlib in polyuq.data_manager.
+    Run in a subprocess so the assertion reflects a genuinely fresh interpreter.
+    """
+
+    def test_import_in_clean_interpreter(self):
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "-c", "import polyuq.data_manager"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            f"import polyuq.data_manager failed in a clean interpreter:\n{result.stderr}"
+        )
