@@ -4,18 +4,69 @@ import shutil
 import traceback
 import sys
 import time
+import tempfile
 from datetime import date
-import simpleflock
-import psutil
-# import ray
 import logging
 from contextlib import contextmanager, nullcontext
 import uuid
 import numpy as np
-import xarray as xr
 
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.INFO)
+
+
+def _get_xr():
+    try:
+        import xarray as xr
+        return xr
+    except ImportError as exc:
+        raise ImportError(
+            "xarray is required for dataset management. "
+            "Install with: pip install polyuq[data]"
+        ) from exc
+
+
+def _get_seaborn():
+    try:
+        import seaborn as sns
+        return sns
+    except ImportError as exc:
+        raise ImportError(
+            "seaborn is required for this plot. "
+            "Install with: pip install polyuq[viz]"
+        ) from exc
+
+
+def _get_ray():
+    try:
+        import ray
+        return ray
+    except ImportError as exc:
+        raise ImportError(
+            "ray is required for distributed evaluation. "
+            "Install with: pip install polyuq[hpc]"
+        ) from exc
+
+
+def _get_simpleflock():
+    try:
+        import simpleflock
+        return simpleflock
+    except ImportError as exc:
+        raise ImportError(
+            "simpleflock is required for file locking. "
+            "Install with: pip install polyuq[hpc]"
+        ) from exc
+
+
+def _get_psutil():
+    try:
+        import psutil
+        return psutil
+    except ImportError as exc:
+        raise ImportError(
+            "psutil is required for process inspection. "
+            "Install with: pip install polyuq[hpc]"
+        ) from exc
 
 global pid
 pid = str(os.getpid())
@@ -29,28 +80,7 @@ import matplotlib.colors
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
-import seaborn as sns
 import scipy.stats
-
-import ray
-
-'''
-PATH=$PATH:/usr/scratch4/sima9999/.local/bin/
-export PATH
-
-conda activate my-conda-env
-export OMP_NUM_THREADS=1 # limit MKL to the number of workers / cpus to avoid hyperthreading
-PYTHONPATH=/usr/scratch4/sima9999/code/:/usr/scratch4/sima9999/git/pyOMA/
-export PYTHONPATH
-export PYTHONUNBUFFERED=1
-IPADDRESS=$(hostname --ip-address)
-ray start --head --dashboard-host $IPADDRESS --dashboard-port=5990 --num-cpus 0
-
-lsrun ray start --address=$IPADDRESS:6379 --redis-password='5241590000000000' --num-cpus=16 --block &
-
-# connect to dashboard at  http://141.54.148.100:5990/
-
-'''
 
 
 class HiddenPrints:
@@ -97,11 +127,11 @@ def simplePbar(total):
 
 class MultiLock():
     '''
-    dbpath = '/vegas/scratch/womo1998/locktest.nc'
+    dbpath = '/path/to/locktest.nc'  # placeholder example
     for i in range(3):
         print(i)
         with MultiLock(dbpath):
-            with open(f"/vegas/scratch/womo1998/locktest.file",'at') as f:
+            with open(f"/path/to/locktest.file",'at') as f:
                 f.write(f'{i}\n')
     '''
 
@@ -112,6 +142,7 @@ class MultiLock():
         self._this_lockfile = f'{self._path}.{pid}.lock'
 
         # simpleflock sometimes gives lock to two processes
+        simpleflock = _get_simpleflock()
         with simpleflock.SimpleFlock(f"{self._path}.lock"):
             while True:
                 lockfile_list = glob.glob(f'{self._path}.*.lock')
@@ -158,9 +189,9 @@ class DataManager(object):
         self.title = title
 
         if result_dir is None:
-            logger.warning(
-                'no result_dir specified, using /usr/scratch4/sima9999/work/modal_uq/')
-            result_dir = '/usr/scratch4/sima9999/work/modal_uq/'
+            import pathlib
+            result_dir = str(pathlib.Path.cwd() / 'polyuq_results')
+            logger.warning(f'no result_dir specified, using {result_dir}')
 
         if not os.path.isdir(result_dir):
             logger.info(f'creating directory(s) {result_dir}')
@@ -333,6 +364,7 @@ class DataManager(object):
         Add additional Monte Carlo samples to a previously evaluated dataset
         does not support provided samples
         '''
+        xr = _get_xr()
 
         logger.warn("Enrichment currently untested.")
         with self.get_database(database='in', rw=False) as ds:
@@ -429,6 +461,7 @@ class DataManager(object):
         a ray head process must be started in an interactive session
 
         '''
+        ray = _get_ray()
         if distributed and not ray.is_initialized():
             if os.path.exists(os.path.expanduser('~/ipaddress.txt')):
                 address = open(os.path.expanduser('~/ipaddress.txt'), 'rt').read().splitlines()[0] + ':6379'
@@ -458,7 +491,9 @@ class DataManager(object):
             # lock files will stay there, make sure to delete them afterwards
             now = time.time()
 
-            with simpleflock.SimpleFlock(os.path.join(result_dir, f'{jid}.lock'), timeout=1) if use_lock else nullcontext():
+            lock_cm = _get_simpleflock().SimpleFlock(
+                os.path.join(result_dir, f'{jid}.lock'), timeout=1) if use_lock else nullcontext()
+            with lock_cm:
                 logger.debug(f'start computing sample {jid}')
 
                 # create the working directory
@@ -467,10 +502,11 @@ class DataManager(object):
                     os.makedirs(result_dir, exist_ok=True)
 
                 if working_dir is True:
-                    try:  #  to get LSF temporary working directory
-                        working_dir = os.path.join(f'/usr/tmp/{os.environ["LSB_JOBID"]}.tmpdir', jid)
-                    except KeyError:
-                        working_dir = os.path.join('/dev/shm/womo1998/', jid)
+                    # use a cluster-provided job id if available (export
+                    # POLYUQ_JOB_ID from your scheduler's wrapper script),
+                    # otherwise fall back to the system temp directory
+                    job_id = os.environ.get('POLYUQ_JOB_ID', 'local')
+                    working_dir = os.path.join(tempfile.gettempdir(), f'{job_id}.tmpdir', jid)
 
                 if working_dir is not None:
                     cwd = os.getcwd()
@@ -489,11 +525,8 @@ class DataManager(object):
                     if not isinstance(ret_vals, tuple):
                         raise RuntimeError('The evaluation function must return a tuple.')
                 except Exception as e:
-                    if "LSB_JOBID" in os.environ:
-                        lsb_jobid = os.environ["LSB_JOBID"]
-                    else:
-                        lsb_jobid = None
-                    logger.warning(f'sample {jid} in job {lsb_jobid} failed')
+                    job_id = os.environ.get('POLYUQ_JOB_ID')
+                    logger.warning(f'sample {jid} in job {job_id} failed')
                     traceback.print_exc()
                     ret_vals = repr(e)
                     error = True
@@ -867,6 +900,7 @@ class DataManager(object):
             Additional keyword arguments are
             passed on to matplotlib's "plot" command. Returns the matplotlib figure
             object containg the subplot grid."""
+            sns = _get_seaborn()
 
             numdata, numvars = data.shape
             names = data.keys()
@@ -1221,8 +1255,11 @@ class DataManager(object):
 
     @classmethod
     def from_existing(cls, dbfile_in,
-                      result_dir='/usr/scratch4/sima9999/work/modal_uq/',
+                      result_dir=None,
                       working_dir=None):
+        if result_dir is None:
+            import pathlib
+            result_dir = str(pathlib.Path.cwd() / 'polyuq_results')
         assert os.path.exists(os.path.join(result_dir, dbfile_in))
 
         cls.result_dir = result_dir
@@ -1280,6 +1317,7 @@ class DataManager(object):
 
         this should be used as a contextmanager, to ensure proper file closing and lock removal
         '''
+        xr = _get_xr()
 
         assert database in ['in', 'out', 'merged', 'processed']
 
@@ -1307,6 +1345,7 @@ class DataManager(object):
             dbfile = file + '_processed' + ext
 
         dbpath = os.path.join(self.result_dir, dbfile)
+        simpleflock = _get_simpleflock()
 
         if not os.path.exists(dbpath):
             logger.debug(f'file {dbfile} will be created')
@@ -1495,11 +1534,12 @@ def student_manager(ambient, nonlinear, friction):
         raise RuntimeError(
             f'This combination of inputs is not supported: {ambient}, {nonlinear}, {friction}')
     print(title)
-    savefolder = '/vegas/scratch/womo1998/data_hadidi/datasets_' + title + '/'
-    result_dir = '/vegas/scratch/womo1998/data_hadidi2/datasets_' + title + '/'
+    import pathlib
+    savefolder = str(pathlib.Path.cwd() / 'polyuq_results' / f'datasets_{title}') + '/'
+    result_dir = str(pathlib.Path.cwd() / 'polyuq_results' / f'datasets_{title}_2') + '/'
 
     if not os.path.exists(result_dir + title + '.nc') or False:
-        data_manager = DataManager(title=title, working_dir='/dev/shm/womo1998/',
+        data_manager = DataManager(title=title, working_dir=tempfile.gettempdir(),
                                    result_dir=result_dir,
                                    overwrite=True)
 
@@ -1677,11 +1717,12 @@ def manipulate_student_fun(jid, snr_db, readfolder, result_dir):
 
 def test_categorical():
     title = 'test_categorical'
-    savefolder = '/usr/scratch4/sima9999/work/modal_uq/'
-    result_dir = '/usr/scratch4/sima9999/work/modal_uq/'
+    import pathlib
+    savefolder = str(pathlib.Path.cwd() / 'polyuq_results') + '/'
+    result_dir = savefolder
 
     if not os.path.exists(result_dir + title + '.nc') or False:
-        data_manager = DataManager(title=title, working_dir='/dev/shm/womo1998/',
+        data_manager = DataManager(title=title, working_dir=tempfile.gettempdir(),
                                    result_dir=result_dir,
                                    overwrite=True)
         data_manager.generate_sample_inputs(names=['N',
@@ -1726,13 +1767,14 @@ def test_imports():
         return (1,)
 
     title = 'test_imports'
-    savefolder = '/usr/scratch4/sima9999/work/modal_uq/'
-    result_dir = '/usr/scratch4/sima9999/work/modal_uq/'
-    # ray.init(address='auto', _redis_password='5241590000000000')
+    import pathlib
+    savefolder = str(pathlib.Path.cwd() / 'polyuq_results') + '/'
+    result_dir = savefolder
+    # ray.init(address='auto')
     #
     # ray.shutdown()
     if not os.path.exists(result_dir + title + '.nc') or True:
-        data_manager = DataManager(title=title, working_dir='/dev/shm/womo1998/',
+        data_manager = DataManager(title=title, working_dir=tempfile.gettempdir(),
                                    result_dir=result_dir,
                                    overwrite=True)
         data_manager.generate_sample_inputs(names=['N', ],
@@ -1753,11 +1795,11 @@ def test():
     # generate input samples
     title = 'test3'
     dbfile_in = f'{title}.nc'
-    result_dir = f'/usr/scratch4/sima9999/work/modal_uq/{title}/'
-    # result_dir=f'/vegas/users/staff/womo1998/Projects/2019_OMA_UQ/data/{title}/'
+    import pathlib
+    result_dir = str(pathlib.Path.cwd() / 'polyuq_results' / title) + '/'
 
     if False:
-        data_manager = DataManager(title=title, working_dir='/dev/shm/womo1998/',
+        data_manager = DataManager(title=title, working_dir=tempfile.gettempdir(),
                                    result_dir=result_dir,
                                    overwrite=True)
 
@@ -1776,9 +1818,8 @@ def test():
         #
     else:
         # data_manager = DataManager.from_existing(dbfile_in=dbfile_in,result_dir = result_dir)
-        # data_manager=DataManager.from_existing(dbfile_in='model_perf.nc', result_dir='/usr/scratch4/sima9999/work/modal_uq/')
         data_manager = DataManager.from_existing(
-            dbfile_in='model_perf2.nc', result_dir='/usr/scratch4/sima9999/work/modal_uq/')
+            dbfile_in='model_perf2.nc', result_dir=str(pathlib.Path.cwd() / 'polyuq_results'))
         with data_manager.get_database('merged') as ds:
             ds.load()
         ds = process_model_perf(ds)
@@ -1813,18 +1854,20 @@ def test2():
         print(kwargs.get('jid'))
         return (np.array(None),)
 
-    result_dir = '/usr/scratch4/sima9999/work/modal_uq/poly-dm-test'
-    dm = DataManager.from_existing('example.nc', result_dir, '/dev/shm/womo1998/')
+    import pathlib
+    result_dir = str(pathlib.Path.cwd() / 'polyuq_results' / 'poly-dm-test')
+    dm = DataManager.from_existing('example.nc', result_dir, tempfile.gettempdir())
     logger.setLevel(logging.DEBUG)
     dm.evaluate_samples(dummy, {}, {'dummy':()}, use_lock=False, remote_kwargs={})
 
 
 def main():
     logger.setLevel(level=logging.INFO)
-    result_dir = '/usr/scratch4/sima9999/work/modal_uq/uq_modal_beam/samples/'
+    import pathlib
+    result_dir = str(pathlib.Path.cwd() / 'polyuq_results' / 'uq_modal_beam' / 'samples') + '/'
 
     dm_grid = DataManager.from_existing('uq_modal_beam.nc', result_dir,
-                                        working_dir='/dev/shm/womo1998/')
+                                        working_dir=tempfile.gettempdir())
     dm_grid.dbfile_out = os.path.join(dm_grid.result_dir, 'uq_modal_beam_valid.nc')
 
     from UQ_Modal_Beam import mapping_validate
@@ -1864,7 +1907,7 @@ def main():
     #         for arg,var in arg_vars.items():
     #             fun_kwargs[arg]=ds[var].item()
     #         print(fun_kwargs)
-    #         res=mapping_validate(**fun_kwargs,jid=jid, working_dir='/dev/shm/womo1998',result_dir='/usr/scratch4/sima9999/work/modal_uq/uq_modal_beam/samples/', skip_existing=False)
+    #         res=mapping_validate(**fun_kwargs, jid=jid, working_dir=working_dir, result_dir=result_dir, skip_existing=False)
     #         print(res)
     #         break
 

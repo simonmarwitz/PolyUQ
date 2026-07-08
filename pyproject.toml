@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polyuq"
+version = "0.1.0a1"
+description = "Polymorphic Uncertainty Quantification for Operational Modal Analysis"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Simon Marwitz", email = "25247720+simonmarwitz@users.noreply.github.com" },
+    { name = "Volkmar Zabel" },
+]
+keywords = [
+    "uncertainty quantification", "imprecise probabilities",
+    "Dempster-Shafer", "evidence theory", "operational modal analysis",
+    "structural health monitoring",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.5",
+    "pandas>=1.5",
+]
+
+[project.optional-dependencies]
+viz = [
+    "seaborn",
+]
+data = [
+    "xarray",
+]
+hpc = [
+    "ray",
+    "simpleflock",
+    "psutil",
+    "alive-progress",
+]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "nbstripout",
+    "nbval",
+]
+docs = [
+    "sphinx",
+    "pydata-sphinx-theme",
+    "myst-nb",
+    "sphinxcontrib-blockdiag",
+    "sphinx-collections",
+    "autoclasstoc",
+]
+
+[project.urls]
+Homepage = "https://github.com/simonmarwitz/PolyUQ"
+Repository = "https://github.com/simonmarwitz/PolyUQ"
+"Bug Tracker" = "https://github.com/simonmarwitz/PolyUQ/issues"
+"Supplemental Data" = "https://doi.org/10.71758/refodat.46"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["polyuq*"]
+exclude = ["tests*", "notebooks*", "examples*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: tests that take more than a few seconds",
+    "hpc: tests requiring ray/cluster environment",
+    "data: tests requiring the refodat dataset (set POLYUQ_DATA_DIR)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::RuntimeWarning",
+]

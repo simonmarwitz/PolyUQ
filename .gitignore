@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.env/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+*~
+
+# Data (never commit large result files)
+*.nc
+*.npz
+*.pkl
+figures/
+polyuq_results/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+*.swp

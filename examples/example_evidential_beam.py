@@ -1,7 +1,7 @@
 '''
 Created on Mar 30, 2020
 
-@author: womo1998
+@author: Simon Marwitz
 '''
 import numpy as np
 import matplotlib.pyplot as plot

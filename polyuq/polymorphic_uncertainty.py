@@ -7,24 +7,41 @@ import scipy.optimize
 # import scipy.interpolate
 import matplotlib
 import matplotlib.pyplot as plt
-import seaborn as sns
 from itertools import product, chain
-from uncertainty.data_manager import HiddenPrints, simplePbar, DataManager
+from polyuq.data_manager import HiddenPrints, simplePbar, DataManager
 import uuid
 import os
 import copy
 import time
 import sys
 import warnings
-from uncertainty import data_manager
+from polyuq import data_manager
 
 warnings.filterwarnings("ignore", message="Initial guess is not within the specified bounds")
 import logging
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.INFO)
 
-from alive_progress import alive_bar
+
+def _get_alive_bar():
+    try:
+        from alive_progress import alive_bar
+        return alive_bar
+    except ImportError as exc:
+        raise ImportError(
+            "alive_progress is required for progress bars. "
+            "Install with: pip install polyuq[hpc]"
+        ) from exc
+
+
+def _get_seaborn():
+    try:
+        import seaborn as sns
+        return sns
+    except ImportError as exc:
+        raise ImportError(
+            "seaborn is required for this plot. "
+            "Install with: pip install polyuq[viz]"
+        ) from exc
 
 '''
 TODO:
@@ -33,7 +50,24 @@ TODO:
 '''
 
 # Monkeypatch NearestND interpolator to facilitate interval optimization
-from scipy.interpolate.interpnd import _ndim_coords_from_arrays
+try:
+    from scipy.interpolate.interpnd import _ndim_coords_from_arrays
+except ImportError:
+    # SciPy ≥ 1.14 removed this private symbol; re-implement the one-liner
+    def _ndim_coords_from_arrays(points, ndim=None):
+        if isinstance(points, tuple) or isinstance(points, list):
+            points = [np.asarray(p) for p in points]
+            if len(points) == 1:
+                points = points[0].ravel()
+            else:
+                points = np.broadcast_arrays(*points)
+                points = np.empty(np.broadcast(*points).shape + (len(points),),
+                                  dtype=float)
+                for i, p in enumerate(np.broadcast_arrays(*[np.asarray(pp) for pp in points])):
+                    points[..., i] = p
+        else:
+            points = np.asarray(points)
+        return points
 
 
 # Shamelessly copied and modified from scipy.interpolate.NearestNDInterpolator.
@@ -1707,6 +1741,7 @@ class PolyUQ(object):
         # keyword argument to compute only the interpolator validation, in order to tune parameters
         intp_eval = kwargs.pop('intp_eval', False)
 
+        alive_bar = _get_alive_bar()
         with  alive_bar(n_imp_hyc * len(iter_ale), **bar_kwargs) as pbar:
             for n_ale in iter_ale:
                 # each supplementary aleatory sample defines boundaries on imprecise variables
@@ -2143,6 +2178,7 @@ class PolyUQ(object):
         else:
             bar_kwargs = {'force_tty':True}
 
+        alive_bar = _get_alive_bar()
         with  alive_bar(n_imp_hyc * n_inc_hyc * n_stat, **bar_kwargs) as pbar:
             # pbar = simplePbar(n_imp_hyc * n_inc_hyc*n_stat)
             for i_imp_hyc in range(n_imp_hyc):
@@ -3000,6 +3036,7 @@ def plot_focals(focals, mass, ax, highlight=None):
 
 
 def plot_grid(df, output='y'):
+    sns = _get_seaborn()
     global hue_norm
     hue_norm = matplotlib.colors.Normalize(3 / 2 * np.min(df[output]) - 1 / 2 * np.max(df[output]), np.max(df[output]))
     # grid = sns.pairplot(df, hue=output, diag_kind='hist', corner=True, kind='hist', markers='.', plot_kws={'hue_norm':hue_norm, 'weights':df[output], 'bins':30}, palette='cubehelix', )
@@ -3025,6 +3062,7 @@ def plot_hyc_grid(df_hyc, grid, output='y', maxx=None, minx=None, out_up=None, o
     # n_vars_imp = inputs_hyc.shape[1]
     # df_hyc = pd.DataFrame(inputs_hyc, columns=[f'$x_{i}$' for i in range(n_vars_imp)])
     # df_hyc['$y$']=outputs_hyc
+    sns = _get_seaborn()
 
     global scatters
     global hue_norm
@@ -3446,7 +3484,7 @@ def example_e():
 
 def test_to_dm():
 
-    logger2 = logging.getLogger('uncertainty.data_manager')
+    logger2 = logging.getLogger('polyuq.data_manager')
     logger2.setLevel(level=logging.WARNING)
     arg_vars = {'q1':'q1', 'q2':'q2'}
 
@@ -3460,9 +3498,13 @@ def test_to_dm():
 
     poly_uq = PolyUQ(vars_ale, vars_epi, dim_ex=dim_ex)
     poly_uq.sample_qmc(N_mcs_ale, N_mcs_epi, check_sample_sizes=False)
+    import pathlib
+    import tempfile
+    result_dir = pathlib.Path.cwd() / 'polyuq_results' / 'poly-dm-test'
+    result_dir.mkdir(parents=True, exist_ok=True)
     dm_grid, dm_ale, dm_epi = poly_uq.to_data_manager('example',
-                                                    working_dir='/dev/shm/womo1998/',
-                                                    result_dir='/usr/scratch4/sima9999/work/modal_uq/poly-dm-test',
+                                                    working_dir=str(pathlib.Path(tempfile.gettempdir()) / 'polyuq_work'),
+                                                    result_dir=str(result_dir),
                                                     overwrite=True)
     dm_grid.evaluate_samples(deterministic_mapping2, arg_vars, {'stress': ()}, dry_run=True)
     ':type dm_grid: DataManager'
