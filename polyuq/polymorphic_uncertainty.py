@@ -191,14 +191,14 @@ class RandomVariable(UncertainVariable):
             elif isinstance(param, (complex, np.complexfloating)):
                 param = [param]
             eval_params.append(param)
-        supp = [np.infty, -np.infty]
+        supp = [np.inf, -np.inf]
         for params in product(*eval_params):  # nested for loop over all eval_params -> cartesian product = full factorial
             rv = self.dist_fun(*params)
             if isinstance(self.dist_fun, scipy.stats.rv_continuous):
                 full_supp = rv.ppf((0, 1))
                 this_supp = rv.ppf(percentiles)
-                if full_supp[0] > -np.infty: this_supp[0] = full_supp[0]
-                if full_supp[1] < np.infty: this_supp[1] = full_supp[1]
+                if full_supp[0] > -np.inf: this_supp[0] = full_supp[0]
+                if full_supp[1] < np.inf: this_supp[1] = full_supp[1]
             elif isinstance(self.dist_fun, scipy.stats.rv_discrete):
                 this_supp = rv.support()
             else:
@@ -275,6 +275,9 @@ class MassFunction(UncertainVariable):
         super().__init__(name, chain.from_iterable(focals), primary)
 
         def get_dtype_num(val):
+            if isinstance(val, UncertainVariable):
+                # dtype is inferred from the nested variable itself, not here
+                return -1
             if np.isnan(val):
                 return -1
             if isinstance(val, np.bool_):
@@ -409,7 +412,7 @@ class MassFunction(UncertainVariable):
 
         incremental = self.incremental
         focals = self._focals
-        supp = [np.infty, -np.infty]
+        supp = [np.inf, -np.inf]
         for incvar, lbound, ubound in focals:  # iterates over rows
 
             if isinstance(lbound, UncertainVariable):
@@ -525,7 +528,7 @@ class MassFunction(UncertainVariable):
         # print(self.name, numeric_focals, inds)
         pdf = np.array([np.sum(np.divide(masses[ind],
                                          focal_lengths[ind],
-                                         out=np.full(np.sum(ind), np.infty),  # account for empty intervals (singletons) -> probability density becomes infinite
+                                         out=np.full(np.sum(ind), np.inf),  # account for empty intervals (singletons) -> probability density becomes infinite
                                          where=focal_lengths[ind] > 0)) for ind in inds])
 
         return pdf
@@ -598,7 +601,7 @@ class PolyUQ(object):
         self.out_name = None
         self.pretty_out_name = None
         self.out_samp = None
-        self.out_valid = [-np.infty, np.infty]
+        self.out_valid = [-np.inf, np.inf]
 
         self.imp_foc = None
         self.val_samp_prim = None
@@ -715,7 +718,7 @@ class PolyUQ(object):
         var_supp = pd.DataFrame(np.empty((2, n_vars)), columns=[var.name for var in all_vars])
         for var in all_vars:
             supp = var.support(percentiles)
-            assert np.all(np.abs(supp) != np.infty)
+            assert np.all(np.abs(supp) != np.inf)
             var_supp[var.name] = supp
             # print(var.name, supp)
             if isinstance(var, RandomVariable):
