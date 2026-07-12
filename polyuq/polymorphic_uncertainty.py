@@ -830,6 +830,149 @@ class PolyUQ(object):
 
         return
 
+    @classmethod
+    def from_propagated_samples(cls, vars_epi, inp_samp_prim, out_samp,
+                                vars_ale=(), dim_ex='cartesian',
+                                percentiles=(0.0001, 0.9999), out_name='out',
+                                inp_suppl_ale=None, inp_suppl_epi=None):
+        '''
+        Construct a PolyUQ instance directly from externally computed input
+        samples and mapping outputs, enabling post-processing (most notably
+        estimate_imp) on quantities that were not propagated by this class
+        itself — e.g. statistic-level outputs of a weighted estimator, where
+        the "mapping" from epistemic sample values to the statistic has
+        already been evaluated elsewhere (Algorithm "proposed" of the
+        OMA-specific processing strategies: surrogate-based interval
+        optimization of modal parameters over the combined Imprecision and
+        Incompleteness hypercubes).
+
+        This performs the same bookkeeping as sample_qmc — variable supports,
+        sample-set dimensions, loop flags — but takes the sample values as
+        given instead of drawing a Halton sequence. NaN entries in out_samp
+        (e.g. epistemic samples where no output could be obtained) are
+        tolerated by estimate_imp, which fits its surrogates on the non-NaN
+        subset.
+
+        Parameters:
+        -----------
+            vars_epi: list of epistemic variables (UncertainVariable)
+                All variables spanning the columns of inp_samp_prim that are
+                epistemic; primary ones (Imprecision) undergo interval
+                optimization in estimate_imp.
+            inp_samp_prim: pd.DataFrame or dict of array-like (N_mcs_epi rows)
+                Sample values of all primary variables, one column per
+                variable name. With primary aleatory variables present, rows
+                0 ... N_mcs_ale - 1 also hold their sample values.
+            out_samp: np.ndarray (N_mcs_ale, N_mcs_epi)
+                Externally computed outputs on the sample lattice; a single
+                row if there are no aleatory variables.
+            vars_ale: list of aleatory variables (UncertainVariable), optional
+                May be empty for purely epistemic post-processing.
+            dim_ex: str
+                Dimension extension procedure, see __init__.
+            percentiles: 2-tuple
+                Support truncation percentiles, as in sample_qmc.
+            out_name: str
+                Name of the output quantity (used in reports and plots).
+            inp_suppl_ale, inp_suppl_epi: pd.DataFrame, optional
+                Sample values of secondary (hyper-) variables; required if
+                vars_ale or vars_epi contain non-primary variables.
+
+        Returns:
+        --------
+            poly_uq: PolyUQ
+                Instance ready for estimate_imp and subsequent statistics.
+        '''
+        poly_uq = cls(vars_ale, vars_epi, dim_ex)
+
+        vars_ale_prim = [var for var in poly_uq.vars_ale if var.primary]
+        all_vars_prim = vars_ale_prim + list(poly_uq.vars_imp)
+
+        inp_samp_prim = pd.DataFrame(inp_samp_prim)
+        missing = [var.name for var in all_vars_prim
+                   if var.name not in inp_samp_prim.columns]
+        if missing:
+            raise ValueError(f'inp_samp_prim is missing columns for the '
+                             f'primary variables {missing}')
+
+        out_samp = np.atleast_2d(np.asarray(out_samp, dtype=np.float64))
+        N_mcs_ale, n_out_epi = out_samp.shape
+
+        loop_ale = np.any([var.primary for var in poly_uq.vars_ale])
+        loop_epi = np.any([var.primary for var in poly_uq.vars_epi])
+
+        if not loop_ale and N_mcs_ale > 1:
+            raise ValueError(f'out_samp has {N_mcs_ale} rows, but there are '
+                             'no primary aleatory variables. Pass a single '
+                             'row of epistemic outputs.')
+        if poly_uq.vars_imp and n_out_epi != inp_samp_prim.shape[0]:
+            raise ValueError(f'out_samp has {n_out_epi} columns, but '
+                             f'inp_samp_prim provides {inp_samp_prim.shape[0]} '
+                             'epistemic samples.')
+        if loop_ale and inp_samp_prim.shape[0] < N_mcs_ale:
+            raise ValueError(f'inp_samp_prim provides {inp_samp_prim.shape[0]} '
+                             f'rows, but out_samp holds {N_mcs_ale} aleatory '
+                             'samples.')
+
+        N_mcs_epi = inp_samp_prim.shape[0]
+
+        # supports of all primary variables and their hyper-variables, plus
+        # standalone secondary variables (as sample_qmc, but the samples are
+        # given, so supports only serve surrogate scaling and probabilities)
+        all_vars = list(poly_uq.all_vars.values())
+        known_names = {var.name for var in all_vars}
+        for var in list(poly_uq.vars_ale) + list(poly_uq.vars_epi):
+            if var.name not in known_names:
+                all_vars.append(var)
+                known_names.add(var.name)
+        var_supp = pd.DataFrame(np.empty((2, len(all_vars))),
+                                columns=[var.name for var in all_vars])
+        for var in all_vars:
+            supp = var.support(percentiles)
+            assert np.all(np.abs(supp) != np.inf)
+            var_supp[var.name] = supp
+
+        # secondary (hyper-) variable samples: externally provided or empty
+        vars_ale_sec = [var for var in poly_uq.vars_ale if not var.primary]
+        if inp_suppl_ale is None:
+            if vars_ale_sec:
+                raise ValueError('inp_suppl_ale is required for the secondary '
+                                 f'aleatory variables '
+                                 f'{[var.name for var in vars_ale_sec]}')
+            inp_suppl_ale = pd.DataFrame(index=pd.RangeIndex(N_mcs_ale))
+        else:
+            inp_suppl_ale = pd.DataFrame(inp_suppl_ale)
+            assert inp_suppl_ale.shape[0] >= N_mcs_ale
+
+        if inp_suppl_epi is None:
+            if poly_uq.vars_inc:
+                raise ValueError('inp_suppl_epi is required for the secondary '
+                                 f'epistemic variables '
+                                 f'{[var.name for var in poly_uq.vars_inc]}')
+            inp_suppl_epi = pd.DataFrame(index=pd.RangeIndex(N_mcs_epi))
+        else:
+            inp_suppl_epi = pd.DataFrame(inp_suppl_epi)
+            assert inp_suppl_epi.shape[0] >= N_mcs_epi
+
+        poly_uq.N_mcs_ale = N_mcs_ale
+        poly_uq.N_mcs_epi = N_mcs_epi
+
+        poly_uq.percentiles = percentiles
+
+        poly_uq.loop_ale = loop_ale
+        poly_uq.loop_epi = loop_epi
+
+        poly_uq.var_supp = var_supp
+        poly_uq.inp_samp_prim = inp_samp_prim
+        poly_uq.inp_suppl_ale = inp_suppl_ale
+        poly_uq.inp_suppl_epi = inp_suppl_epi
+
+        poly_uq.out_name = out_name
+        poly_uq.pretty_out_name = out_name
+        poly_uq.out_samp = out_samp
+
+        return poly_uq
+
     def to_data_manager(self, title, result_dir, working_dir=None, **kwargs):
         '''
         combining PolyUQ and DataManager
@@ -2554,7 +2697,7 @@ class PolyUQ(object):
             # compute output prob_dens for this hypercube
             if self.dim_ex == 'cartesian':
                 # returns 1.0 for empty hypercube
-                hyc_mass[i_hyc] = np.product([var.masses[ind] for var, ind in zip(vars_, foc_inds)])
+                hyc_mass[i_hyc] = np.prod([var.masses[ind] for var, ind in zip(vars_, foc_inds)])
             elif self.dim_ex == 'hadamard':
                 # returns nan for empty hypercube
                 hyc_mass[i_hyc] = np.average([var.masses[ind] for var, ind in zip(vars_, foc_inds)])

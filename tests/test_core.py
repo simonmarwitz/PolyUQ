@@ -253,3 +253,113 @@ class TestDataManagerImportOrder:
         assert result.returncode == 0, (
             f"import polyuq.data_manager failed in a clean interpreter:\n{result.stderr}"
         )
+
+
+class TestFromPropagatedSamples:
+    """from_propagated_samples + estimate_imp on a closed-form toy problem.
+
+    y = x1 + 2 * x2 with Imprecision focals
+    x1: (0, 1) mass 0.6 | (0.5, 2) mass 0.4 ; x2: (1, 3) mass 1.0
+    gives the exact output intervals
+    H0 = [2, 7] (mass 0.6), H1 = [2.5, 8] (mass 0.4).
+    """
+
+    EXPECTED = np.array([[[2.0, 7.0], [2.5, 8.0]]])
+
+    @staticmethod
+    def _toy_polyuq(N=200, nan_frac=0.0, seed=0):
+        x1 = MassFunction("x1", [(0.0, 1.0), (0.5, 2.0)], [0.6, 0.4],
+                          primary=True)
+        x2 = MassFunction("x2", [(1.0, 3.0)], [1.0], primary=True)
+        rng = np.random.default_rng(seed)
+        s1 = rng.uniform(0.0, 2.0, N)
+        s2 = rng.uniform(1.0, 3.0, N)
+        y = s1 + 2.0 * s2
+        if nan_frac:
+            y[rng.random(N) < nan_frac] = np.nan
+        return PolyUQ.from_propagated_samples(
+            [x1, x2], {"x1": s1, "x2": s2}, y[None, :], out_name="y")
+
+    def test_bookkeeping(self):
+        pq = self._toy_polyuq()
+        assert pq.N_mcs_ale == 1
+        assert pq.N_mcs_epi == 200
+        assert not pq.loop_ale
+        assert pq.loop_epi
+        assert np.allclose(pq.var_supp["x1"], [0.0, 2.0])
+        assert np.allclose(pq.var_supp["x2"], [1.0, 3.0])
+        assert len(pq.imp_hyc_foc_inds) == 2
+        assert np.allclose(pq.imp_hyc_mass, [0.6, 0.4])
+        assert pq.out_samp.shape == (1, 200)
+        assert pq.out_samp.dtype == np.float64
+
+    def test_estimate_imp_closed_form(self):
+        pq = self._toy_polyuq()
+        imp_foc, _, _, _, _ = pq.estimate_imp(interp_fun="rbf",
+                                              opt_meth="genetic")
+        assert imp_foc.shape == (1, 2, 2)
+        # RBF over 200 samples of a linear function is near-exact, but the
+        # genetic optimizer (polish=False) stops within ~5 % of the output
+        # range of the exact corner optima
+        assert np.allclose(imp_foc, self.EXPECTED, atol=0.3)
+        # the hypercube-specific bounds must be distinguishable:
+        # H1 is shifted right against H0 by (0.5, 1.0)
+        assert imp_foc[0, 1, 0] > imp_foc[0, 0, 0]
+        assert imp_foc[0, 1, 1] > imp_foc[0, 0, 1]
+
+    def test_nan_outputs_tolerated(self):
+        pq = self._toy_polyuq(nan_frac=0.15, seed=1)
+        assert np.isnan(pq.out_samp).sum() > 0
+        imp_foc, _, _, _, _ = pq.estimate_imp(interp_fun="rbf",
+                                              opt_meth="genetic")
+        assert np.allclose(imp_foc, self.EXPECTED, atol=0.35)
+
+    def test_with_primary_aleatory_variable(self):
+        x1 = MassFunction("x1", [(0.0, 1.0), (0.5, 2.0)], [0.6, 0.4],
+                          primary=True)
+        x2 = MassFunction("x2", [(1.0, 3.0)], [1.0], primary=True)
+        a = RandomVariable("uniform", "a", [0.0, 1.0], primary=True)
+        rng = np.random.default_rng(2)
+        N = 200
+        s1 = rng.uniform(0.0, 2.0, N)
+        s2 = rng.uniform(1.0, 3.0, N)
+        a_samp = rng.uniform(0.0, 1.0, N)
+        # output shifts by the aleatory value of each row
+        out = np.vstack([s1 + 2.0 * s2 + a_samp[n] for n in range(2)])
+        pq = PolyUQ.from_propagated_samples(
+            [x1, x2], {"x1": s1, "x2": s2, "a": a_samp}, out,
+            vars_ale=[a], out_name="y")
+        assert pq.N_mcs_ale == 2
+        assert pq.loop_ale
+        imp_foc, _, _, _, _ = pq.estimate_imp(interp_fun="rbf",
+                                              opt_meth="genetic")
+        assert imp_foc.shape == (2, 2, 2)
+        for n in range(2):
+            assert np.allclose(imp_foc[n], self.EXPECTED[0] + a_samp[n],
+                               atol=0.35)
+
+    def test_missing_column_raises(self):
+        x1 = MassFunction("x1", [(0.0, 1.0)], [1.0], primary=True)
+        x2 = MassFunction("x2", [(1.0, 3.0)], [1.0], primary=True)
+        with pytest.raises(ValueError, match="missing columns"):
+            PolyUQ.from_propagated_samples(
+                [x1, x2], {"x1": np.zeros(10)}, np.zeros((1, 10)))
+
+    def test_out_rows_without_aleatory_raises(self):
+        x1 = MassFunction("x1", [(0.0, 1.0)], [1.0], primary=True)
+        with pytest.raises(ValueError, match="no primary aleatory"):
+            PolyUQ.from_propagated_samples(
+                [x1], {"x1": np.zeros(10)}, np.zeros((3, 10)))
+
+    def test_epi_sample_count_mismatch_raises(self):
+        x1 = MassFunction("x1", [(0.0, 1.0)], [1.0], primary=True)
+        with pytest.raises(ValueError, match="epistemic samples"):
+            PolyUQ.from_propagated_samples(
+                [x1], {"x1": np.zeros(10)}, np.zeros((1, 8)))
+
+    def test_secondary_epistemic_requires_suppl(self):
+        x1 = MassFunction("x1", [(0.0, 1.0)], [1.0], primary=True)
+        c = MassFunction("c", [(2.0, 3.0)], [1.0], primary=False)
+        with pytest.raises(ValueError, match="inp_suppl_epi"):
+            PolyUQ.from_propagated_samples(
+                [x1, c], {"x1": np.zeros(10)}, np.zeros((1, 10)))
