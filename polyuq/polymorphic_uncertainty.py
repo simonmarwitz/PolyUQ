@@ -1533,8 +1533,6 @@ class PolyUQ(object):
             if var.primary:
                 # assign weight to to all hypercubes
                 # sampling pdf for each value (uniform) = 1 / np.diff(var_supp)
-                logger.debug(var.prob_dens(inp_samp_prim[var.name])[270])
-                # logger.debug(np.diff(var_supp[var.name])[270])
                 p_weights *= np.repeat(var.prob_dens(inp_samp_prim[var.name])[:, np.newaxis] * np.diff(var_supp[var.name]), n_imp_hyc, axis=1)
 
         # probabilities are computed for pre-computed stochastic samples as the product of PDFs of the underlying RVs
@@ -1552,19 +1550,12 @@ class PolyUQ(object):
                     # caching probability densities if a variable is hypervariable of multiple variables
                     if hyp_var.primary:
                         hyp_dens[hyp_var.name] = hyp_var.prob_dens(inp_samp_prim[hyp_var.name]) * np.diff(var_supp[hyp_var.name])
-                        logger.debug(hyp_var.prob_dens(inp_samp_prim[hyp_var.name])[270])
-                        # logger.debug(np.diff(var_supp[hyp_var.name])[270])
                     else:
                         hyp_dens[hyp_var.name] = hyp_var.prob_dens(inp_suppl_ale[hyp_var.name]) * np.diff(var_supp[hyp_var.name])
-                        logger.debug(hyp_var.prob_dens(inp_suppl_ale[hyp_var.name])[270])
-                        # logger.debug(np.diff(var_supp[hyp_var.name])[270])
                 p_weights[:, i_weight] *= hyp_dens[hyp_var.name]
-            # logger.debug(hyp_dens[hyp_var.name][270])
-            logger.debug(p_weights[270, i_weight])
             # normalize
             # dividing by sum: Normalization constant 1/C
             p_weights[:, i_weight] /= np.sum(p_weights[:, i_weight])
-            logger.debug(p_weights[270, i_weight])
 
         if i_imp is None:
             return p_weights
