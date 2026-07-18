@@ -552,19 +552,51 @@ class MassFunction(UncertainVariable):
 
 class PolyUQ(object):
 
-    def __init__(self, vars_ale, vars_epi, dim_ex='cartesian'):
+    PATHS = ('full', 'fast_build', 'fast_posthoc')
+
+    def __init__(self, vars_ale, vars_epi, dim_ex='cartesian', path='full'):
         '''
         primary / secondary (hyper-) variables
-        
+
         to take into account variables that share samples they can be named equally
         e.g. to create a a precise variable in an imprecision context
-        
+
         Parameters:
         -----------
-            vars_epi: list of epistemic variables (objects of UncertainVariable class) 
+            vars_epi: list of epistemic variables (objects of UncertainVariable class)
                    (uncertainty quantification by interval optimization [approximated by QMCS])
-            vars_ale: list of aleatory variables (objects of UncertainVariable class) 
+            vars_ale: list of aleatory variables (objects of UncertainVariable class)
                    (uncertainty quantification by quasi Monte-Carlo methods)
+            path: str ['full', 'fast_build', 'fast_posthoc']
+                The order in which Variability (V), Imprecision (I) and
+                Incompleteness (C) are processed:
+
+                'full' (original):
+                    per-sample propagation over the full lattice, then I per
+                    aleatory sample (estimate_imp), then C interval
+                    optimization wrapping the re-weighted V statistic
+                    (optimize_inc): V-samples -> I -> (C-opt x V-stat).
+                    Variability-bounded Imprecision focals resolve inside the
+                    aleatory loop and are fully supported.
+                'fast_build' (statistic level, build-time weighting):
+                    the V axis is collapsed first by an injected weighted
+                    estimator called with weights conditioned on *sampled* C
+                    values (estimate_stat), then I and C are interval
+                    optimized together on the statistic level
+                    (to_statistic_level -> estimate_imp).
+                'fast_posthoc' (statistic level, C optimization by
+                    re-weighting):
+                    the V axis is collapsed by one *unweighted* injected
+                    estimator call per epistemic sample (estimate_stat), C is
+                    interval optimized by re-weighting through an injected
+                    evaluator (optimize_inc(evaluator=...)), then I is
+                    interval optimized on the statistic level.
+
+                Both fast paths compute all V statistics *before* any
+                epistemic processing, which permanently severs the mechanism
+                that lets secondary-Variability-bounded Imprecision focals
+                contribute: a warning is issued at construction (not only
+                when estimate_imp finally fails).
         '''
         for var in vars_ale:
             assert isinstance(var, UncertainVariable)
@@ -572,6 +604,9 @@ class PolyUQ(object):
             assert isinstance(var, UncertainVariable)
 
         assert dim_ex in ['cartesian', 'hadamard', 'vacuous']
+
+        if path not in self.PATHS:
+            raise ValueError(f"path must be one of {self.PATHS}, got {path!r}")
 
         # freeze the variable sets in tuples, to avoid later alterations which might break all kinds of things
         self.vars_ale = tuple(vars_ale)
@@ -585,6 +620,8 @@ class PolyUQ(object):
         self._hyc_hyp_vars = None
 
         self.dim_ex = dim_ex
+        self.path = path
+        self._validate_path()
 
         self.N_mcs_ale = None
         self.N_mcs_epi = None
@@ -617,9 +654,39 @@ class PolyUQ(object):
         self.S_conf = None
         self.S_meth = None
 
-        self.stoch_weights = None
-        self.stoch_stats = None
-        self.stoch_mass = None
+        self.stat_db = None
+
+    def _validate_path(self):
+        '''
+        Early structural checks for the chosen processing path, so that
+        incompatible variable definitions surface at construction and not
+        only after an expensive propagation run.
+        '''
+        if self.path == 'full':
+            return
+
+        vars_ale_sec = [var for var in self.vars_ale if not var.primary]
+        if vars_ale_sec:
+            logger.warning(
+                f"Path '{self.path}' collapses the Variability axis into "
+                f"statistics before any epistemic processing; the secondary "
+                f"Variability variables "
+                f"{[var.name for var in vars_ale_sec]} can then no longer "
+                f"resolve per aleatory sample. Imprecision focals bounded by "
+                f"them are structurally unsupported on the fast paths.")
+
+        for var in self.vars_imp:
+            if not isinstance(var, MassFunction):
+                continue
+            for _, lbound, ubound in var._focals:
+                if isinstance(lbound, UncertainVariable) or \
+                        isinstance(ubound, UncertainVariable):
+                    logger.warning(
+                        f"The Imprecision variable {var.name} has an "
+                        f"UncertainVariable-valued focal bound. Its global "
+                        f"numeric focals cannot be resolved on path "
+                        f"'{self.path}' and estimate_imp will fail. Use "
+                        f"path='full' or plain numeric focal bounds.")
 
     @property
     def all_vars(self):
@@ -835,7 +902,8 @@ class PolyUQ(object):
     def from_propagated_samples(cls, vars_epi, inp_samp_prim, out_samp,
                                 vars_ale=(), dim_ex='cartesian',
                                 percentiles=(0.0001, 0.9999), out_name='out',
-                                inp_suppl_ale=None, inp_suppl_epi=None):
+                                inp_suppl_ale=None, inp_suppl_epi=None,
+                                multi_row=False):
         '''
         Construct a PolyUQ instance directly from externally computed input
         samples and mapping outputs, enabling post-processing (most notably
@@ -878,6 +946,12 @@ class PolyUQ(object):
             inp_suppl_ale, inp_suppl_epi: pd.DataFrame, optional
                 Sample values of secondary (hyper-) variables; required if
                 vars_ale or vars_epi contain non-primary variables.
+            multi_row: bool
+                Permit multiple out_samp rows without primary aleatory
+                variables: estimate_imp then fits one surrogate per row.
+                Used for [lower, upper] statistic-bound pairs
+                (combine_bound_rows) and per-hypercube-group statistic rows
+                (estimate_imp(hyc_rows=...)) on the fast paths.
 
         Returns:
         --------
@@ -902,10 +976,12 @@ class PolyUQ(object):
         loop_ale = np.any([var.primary for var in poly_uq.vars_ale])
         loop_epi = np.any([var.primary for var in poly_uq.vars_epi])
 
-        if not loop_ale and N_mcs_ale > 1:
+        if not loop_ale and N_mcs_ale > 1 and not multi_row:
             raise ValueError(f'out_samp has {N_mcs_ale} rows, but there are '
                              'no primary aleatory variables. Pass a single '
-                             'row of epistemic outputs.')
+                             'row of epistemic outputs, or multi_row=True '
+                             'for intentional per-row surrogates (bound '
+                             'pairs, hypercube groups).')
         if poly_uq.vars_imp and n_out_epi != inp_samp_prim.shape[0]:
             raise ValueError(f'out_samp has {n_out_epi} columns, but '
                              f'inp_samp_prim provides {inp_samp_prim.shape[0]} '
@@ -1233,255 +1309,157 @@ class PolyUQ(object):
 
         return out_samp  # , p_weights
 
-    def weights_full_stoch(self, N_mcs_ale=None, N_mcs_epi=None, singleton_enlargement=0.01):
+    def estimate_stat(self, estimator, weighted=None, eliminate=True,
+                      **kwargs):
         '''
-        imprecision variables will be treated as distributed according to the pignistic pdf
-        variablity variables will be treated the usual way
-        incompletenes variables will be treated as distributed according to the pignistic pdf
-        
-        algorithm
-        sample N_mcs_ale samples of incompleteness variables with importance weighting by the pignistic pdf 
-        for each N_mcs_ale sample:
-            compute variability probability according to sampled incompleteness parameters
-            compute imprecision probability according to sampled variability parameters
-            assmble N_mcs_ale x N_mcs_epi grid of weights
-        
-        
-        we have a problem here:
-        currently in evidential_stochastic_beams 88 % of samples get their p_weight=0
-        
-        1)
-        sampling incompleteness variables with wide intervals on the mean parameter
-        invalidates many aleatory samples due to them being "outside the stochastic pdf"
-        how to solve:
-            - sample incompleteness variables in a third dimension resulting in a
-                (N_mcs_epi x N_mcs_ale x N_mcs_epi) grid for p_weights
-                (that is 60 GB memory in evidential_stochastic_beams, double that for out_samp)
-                by that, each aleatory sample would be used multiple times and guaranteed to be used
-            -> implement it!
-        
-        this does not happen in incompleteness optimization, because we optimize
-        over the whole interval of the parameter.
-        Nevertheless with sharp pdfs and large uncertainty on the location parameter
-        only a small fraction of the computed samples is used in the statistic estimator
-        regardless of the location parameter (sliding the sharp pdf over the sample space)
-        which results in high standard error
-        
-        2)
-        similarly with imprecision variables with sole empty variability intervals
-        their pignistic pdf becomes zero for almost all epistemic samples, e.g. 
-        this is the case for ice_mass in evidential_stochastic_beams, where ice_occ==0
-        its pignistic pdf becomes zero for all epistemic samples. that in turn means,
-        that only those samples with ice_occ=1 are taken into account (see 3 as a related issue)
-        how to solve:
-            - we build the pignistic pdf with expected values from variability interval bounds
-            - we "normalize" the pignistic pdf
-            - we hack around it by redefining ice_mass as a non-polymorphic variable (pure imprecision)
-            also disengage similar uncertainty modeling (this had already required more hacks, i.e. 
-            variables can either be primary variables or hypervariables, but not both)
-            -> do this!
-        
-        this does not happen in imprecision optimization due to surrogate modeling 
-        and exclusion of empty intervals from the set of optimization variables
-        but still, the interpolator uses the input samples from the full interval
-        even though they might not be sensitive (ignored in the model function)
-        
-        3)
-        empty intervals (singletons) transform to infinity in the pignistic pdf
-        -> not quite suitable as weights 
-        
-        
+        Variability-collapse driver for the fast paths: evaluate the injected
+        (external) statistic estimator over all epistemic samples, with the
+        Incompleteness-conditioned aleatory probability weights computed
+        internally. There is no public weights exit point -- the estimator
+        is *called with* the weights, mirroring propagate(mapping, ...) and
+        optimize_inc(stat_fun, ...).
+
+        For each epistemic sample n_epi:
+
+        path 'fast_build' (weighted=True):
+            for each group of Imprecision hypercubes sharing an identical
+            weight vector (deduped internally):
+                weights = self._weights(i_imp, n_epi, eliminate=True)
+                result = estimator(n_epi, i_imp, weights, **kwargs)
+        path 'fast_posthoc' (weighted=False):
+            result = estimator(n_epi, None, None, **kwargs)   (one
+            unweighted build; re-weighting happens later in
+            optimize_inc(evaluator=...))
+
         Parameters:
         -----------
-        
-            singleton_enlargement: float (0...1)
-                Empty intervals are characterized by singletons. In order to match
-                a sufficient number of samples, they are converted to intervals with
-                the width set to a percentage of the support given by this parameter.
+            estimator: callable(n_epi, i_imp, weights, **kwargs) -> dict
+                External statistic estimation, e.g. a wrapper around a
+                weighted OMA identification. Expected keys:
+                'keys':  sequence of opaque row keys (e.g. pole identifiers)
+                'point': (n_rows, ...) point estimates (e.g. mean and
+                         variance per pole) -- the clustering EXIT data
+                'cdf':   (n_rows, n_stat), optional -- expanded statistic
+                         rows (e.g. parametric CDF values), later selected
+                         through stat_rows / to_statistic_level (ENTRY)
+                Additional keys are stored untouched.
+            weighted: bool, optional
+                Defaults by path: 'fast_build' -> True, 'fast_posthoc' ->
+                False.
+            eliminate: bool
+                Forwarded to _weights: apply the per-hypercube
+                secondary-Variability focal-bound elimination (raises when a
+                cell's weights are eliminated entirely). Pass False to
+                reproduce weight computations that predate the elimination's
+                implementation.
+
+        Returns and stores self.stat_db: a list of dicts (the estimator's
+        keys plus n_epi and i_imp_hycs, the tuple of Imprecision hypercubes
+        the entry covers). stat_db is not persisted by save_state; persist
+        it externally like any pole database.
         '''
+        if weighted is None:
+            if self.path == 'full':
+                raise RuntimeError(
+                    "estimate_stat is a fast-path method; on path='full' the "
+                    "statistic is evaluated inside optimize_inc instead. "
+                    "Pass weighted= explicitly to drive an external "
+                    "estimator from a 'full'-path instance anyway.")
+            weighted = self.path == 'fast_build'
 
-        logger.info('Computing full stochastic weights...')
-        if N_mcs_ale is None:
-            N_mcs_ale = self.N_mcs_ale
-        if N_mcs_epi is None:
-            N_mcs_epi = self.N_mcs_epi
+        N_mcs_epi = self.N_mcs_epi
+        n_imp_hyc = len(self.imp_hyc_foc_inds)
 
-        vars_ale = self.vars_ale
-        vars_imp = self.vars_imp
-        vars_inc = self.vars_inc
+        logger.info(f'Estimating aleatory statistics with the external '
+                    f'estimator ({"weighted" if weighted else "unweighted"}) '
+                    f'for {N_mcs_epi} epistemic samples...')
 
-        inp_samp_prim = self.inp_samp_prim
-        inp_suppl_ale = self.inp_suppl_ale
-        inp_suppl_epi = self.inp_suppl_epi
-        var_supp = self.var_supp
-
-        p_weights = np.full((N_mcs_epi, N_mcs_ale, N_mcs_epi,), 1.0, dtype=np.float32)
-
-        '''
-        for n_ale in range(N_mcs_ale):
-            freeze vars_ale (secondary) to inp_supp_ale.iloc[n_ale]
-            compute p_weights for vars_imp and inp_samp_prim.iloc[:N_mcs_epi]
-        
-        -> p_weights matrix (N_mcs_ale x N_mcs_epi)
-            
+        stat_db = []
         for n_epi in range(N_mcs_epi):
-            freeze vars_inc to inp_suppl_epi.iloc[n_epi]
-            compute p_weights for vars_ale (primary) and inp_samp_prim.iloc[:N_mcs_ale]
-            compute p_weights for vars_ale (secondary) and inp_supp_ale.iloc[:N_mcs_ale]
-        -> p_weights matrix (N_mcs_epi x N_mcs_ale)
-        
-        compute p_weights for vars_inc and inp_supp_epi.iloc[:N_mcs_epi] 
-        -> p_weights vector (N_mcs_epi,)
-        this would be (N_mcs_epi x N_mcs_epi) if any imprecision variable would 
-        be dependent on an incompletness variable, which does not make sense in 
-        terms of uncertainty modeling
-        
-        multiply full_p_weights matrix with all three p_weights vectors/matrices
-        '''
-
-        pbar = simplePbar(N_mcs_ale + N_mcs_epi + 3)
-        '''
-        1. Compute weights for imprecision variables
-        '''
-        # plt.figure()
-        # non-polymorphic weights
-        imp_weights = np.full((N_mcs_epi,), 1.0, dtype=np.float32)
-        for var in vars_imp:
-            if var.is_poly: continue
-            samp = inp_samp_prim[var.name].iloc[:N_mcs_epi].to_numpy()
-            # also divide pdf by sampling pdf
-            pdf = var.prob_dens(samp, singleton_enlargement) * np.diff(var_supp[var.name])
-            imp_weights = pdf
-            # plt.plot((samp-var_supp[var.name][0])/np.diff(var_supp[var.name]), pdf, label=var.name, ls='none', marker='.')
-            if logger.isEnabledFor(logging.DEBUG): logger.debug(f'{var.name}:{imp_weights}')
-        next(pbar)
-
-        # polymorphic weights
-        for n_ale in range(N_mcs_ale):
-            # freeze aleatory hypervariables (variability + imprecision)
-            for var in vars_ale:
-                if var.primary:
-                    continue
-                    # val = inp_samp_prim[var.name].iloc[n_ale]
-                else:
-                    val = inp_suppl_ale[var.name].iloc[n_ale]
-                var.freeze(val)
-                # also divide pdf by sampling pdf
-            # compute weights for imprecision variables and epistemic primary samples
-            this_weights = np.copy(imp_weights)
-            for var in vars_imp:
-                if not var.is_poly: continue
-                # also divide pdf by sampling pdf
-                samp = inp_samp_prim[var.name].iloc[:N_mcs_epi].to_numpy()
-                pdf = var.prob_dens(samp, singleton_enlargement) * np.diff(var_supp[var.name])
-                this_weights *= pdf
-                # plt.plot((samp-var_supp[var.name][0])/np.diff(var_supp[var.name]), pdf, label=var.name, ls='none', marker='.')
-                if logger.isEnabledFor(logging.DEBUG): logger.debug(f'{var.name}:{this_weights}')
-            # repeat weights for all incompleteness variables along first axis (epistemic)
-            # plt.legend()
-            # plt.show()
-            # return
-            p_weights[:, n_ale,:] *= np.repeat(this_weights[np.newaxis,:], N_mcs_epi, 0)
-            next(pbar)
-
-        '''
-        1. Compute weights for variability variables
-        '''
-        # non-polymorphic weights
-        var_weights = np.full((N_mcs_ale,), 1.0, dtype=np.float32)
-        for var in vars_ale:
-            if var.is_poly: continue
-            if var.primary:
-                samp = inp_samp_prim[var.name].iloc[:N_mcs_ale].to_numpy()
+            if weighted:
+                cache = {}
+                for i_imp in range(n_imp_hyc):
+                    weights = self._weights(i_imp=i_imp, n_epi=n_epi,
+                                            eliminate=eliminate)
+                    key = weights.tobytes()
+                    if key not in cache:
+                        cache[key] = (estimator(n_epi, i_imp, weights,
+                                                **kwargs), [])
+                    cache[key][1].append(i_imp)
+                for result, i_imps in cache.values():
+                    stat_db.append(dict(result, n_epi=n_epi,
+                                        i_imp_hycs=tuple(i_imps)))
+                logger.debug(f'Epistemic sample {n_epi}: {len(cache)} '
+                             f'distinct weighted estimation(s) for '
+                             f'{n_imp_hyc} hypercubes.')
             else:
-                samp = inp_suppl_ale[var.name].iloc[:N_mcs_ale].to_numpy()
-            # also divide pdf by sampling pdf
-            pdf = var.prob_dens(samp) * np.diff(var_supp[var.name])
-            var_weights *= pdf
+                result = estimator(n_epi, None, None, **kwargs)
+                stat_db.append(dict(result, n_epi=n_epi,
+                                    i_imp_hycs=tuple(range(n_imp_hyc))))
 
-            if logger.isEnabledFor(logging.DEBUG): logger.debug(f'{var.name}:{var_weights}')
-        next(pbar)
+        self.stat_db = stat_db
+        return stat_db
 
-        # polymorphic weights
-        for n_epi in range(N_mcs_epi):
-            # freeze epistemic hypervariables (incompleteness + variability)
-            for var in vars_inc:
-                val = inp_suppl_epi[var.name].iloc[n_epi]
-                var.freeze(val)
-
-            # compute weights for variability variables and aleatory samples (primary and supplemental)
-            this_weights = np.copy(var_weights)
-            for var in vars_ale:
-                if not var.is_poly: continue
-                if var.primary:
-                    samp = inp_samp_prim[var.name].iloc[:N_mcs_ale].to_numpy()
-                else:
-                    samp = inp_suppl_ale[var.name].iloc[:N_mcs_ale].to_numpy()
-                # also divide pdf by sampling pdf
-                pdf = var.prob_dens(samp) * np.diff(var_supp[var.name])
-                this_weights *= pdf
-                if logger.isEnabledFor(logging.DEBUG): logger.debug(f'{var.name}:{this_weights}')
-
-            # repeat weights for all imprecision variables along last axis (epistemic)
-            p_weights[n_epi,:,:] *= np.repeat(this_weights[:, np.newaxis], N_mcs_epi, 1)
-            next(pbar)
-
+    def stat_rows(self, selection, field='cdf', i_stat=None):
         '''
-        1. Compute weights for incompleteness variables
+        Assemble statistic-level output rows from self.stat_db for one
+        cluster (ENTRY-point bookkeeping after external clustering).
+
+        selection: iterable of (i_entry, i_row) pairs
+            stat_db entry index and row index within that entry -- e.g. the
+            poles of one cluster, at most one per (n_epi, hypercube group).
+            The row keys exposed in stat_db serve the external clustering;
+            the indices come back here.
+        field: str
+            The estimator output to read ('cdf', 'point', ...).
+        i_stat: int, optional
+            Column of the field when its rows are not scalar (e.g. the CDF
+            level).
+
+        Returns:
+        --------
+            rows: np.ndarray (n_rows, N_mcs_epi)
+                Unique output rows; epistemic samples without a selected
+                entry are NaN.
+            hyc_rows: np.ndarray (n_imp_hyc,) or None
+                Row index each Imprecision hypercube belongs to (pass to
+                estimate_imp of the statistic-level instance); None when a
+                single row covers all hypercubes (weight-degenerate case).
         '''
-        # non-polymorphic weights
-        inc_weights = np.full((N_mcs_epi,), 1.0, dtype=np.float32)
-        for var in vars_inc:
-            samp = inp_suppl_epi[var.name].iloc[:N_mcs_epi].to_numpy()
-            pdf = var.prob_dens(samp, singleton_enlargement) * np.diff(var_supp[var.name])
-            inc_weights *= pdf
+        if self.stat_db is None:
+            raise RuntimeError('estimate_stat must be run first.')
+        n_imp_hyc = len(self.imp_hyc_foc_inds)
+        N_mcs_epi = self.N_mcs_epi
 
-            if logger.isEnabledFor(logging.DEBUG): logger.debug(f'{var.name}:{inc_weights}')
-        # repeat weights for all imprecision variables along last axis (epistemic)
-        rep_inc_weights = np.repeat(inc_weights[:, np.newaxis], N_mcs_ale, -1)
-        p_weights[:,:,:] *= np.repeat(rep_inc_weights[:,:, np.newaxis], N_mcs_epi, -1)
-        next(pbar)
+        per_hyc = np.full((n_imp_hyc, N_mcs_epi), np.nan)
+        for i_entry, i_row in selection:
+            entry = self.stat_db[i_entry]
+            values = np.ravel(np.asarray(entry[field], dtype=np.float64)[i_row])
+            if values.size > 1:
+                if i_stat is None:
+                    raise ValueError(f"The '{field}' rows hold {values.size} "
+                                     f"values; pass i_stat to select one.")
+                value = values[i_stat]
+            else:
+                value = values[0]
+            for i_hyc in entry['i_imp_hycs']:
+                per_hyc[i_hyc, entry['n_epi']] = value
 
-        # sum up along incompleteness dimension (the alternative: repeating samples would simply count and weight multiple times)
-        p_weights = np.sum(p_weights, axis=0)
-        # p_weights /= np.sum(p_weights)
-        self.stoch_weights = p_weights
-
-        non_zero = p_weights != 0
-        logger.info(f'{np.sum(non_zero)/(N_mcs_ale*N_mcs_epi)*100} percent of samples have non-zero weights. '
-                    f'Gobal coverage: {np.sum(np.any(non_zero, axis=0))} out of {N_mcs_epi} imprecision samples and {np.sum(np.any(non_zero, axis=1))} out of {N_mcs_ale} aleatory samples')
-
-        return p_weights
-
-    def stat_full_stoch(self, stat_fun, stat_fun_kwargs={},):
-        '''
-        stat_fun should return all n_stat at once
-        
-        '''
-
-        p_weights = self.stoch_weights
-        N_mcs_ale, N_mcs_epi = p_weights.shape
-
-        out_samp = self.out_samp[:N_mcs_ale,:N_mcs_epi]
-
-        out_samp = out_samp.flatten()
-        p_weights = p_weights.flatten()
-
-        non_zero = p_weights != 0
-        out_samp = out_samp[non_zero]
-        p_weights = p_weights[non_zero]
-
-        sort_ind = np.argsort(out_samp)
-        out_samp = out_samp[sort_ind]
-        p_weights = p_weights[sort_ind]
-
-        stat_vals = stat_fun(out_samp, p_weights, **stat_fun_kwargs)
-        focals_stats = stat_vals[:, np.newaxis, np.newaxis]
-
-        self.stoch_stats = focals_stats
-        self.stoch_mass = np.array([1, ])
-
-        return focals_stats, self.stoch_mass
+        # bytewise dedupe of identical rows: np.unique(axis=0) treats the NaN
+        # columns of unfound modes as unequal and would never merge them
+        row_index = {}
+        hyc_rows = np.empty(n_imp_hyc, dtype=int)
+        rows = []
+        for i_hyc in range(n_imp_hyc):
+            key = per_hyc[i_hyc].tobytes()
+            if key not in row_index:
+                row_index[key] = len(rows)
+                rows.append(per_hyc[i_hyc])
+            hyc_rows[i_hyc] = row_index[key]
+        rows = np.vstack(rows)
+        if rows.shape[0] == 1:
+            return rows, None
+        return rows, hyc_rows
 
     def probabilities_imp(self, i_imp=None):
 
@@ -1563,10 +1541,90 @@ class PolyUQ(object):
         else:
             return p_weights[:, 0]
 
+    def _weights(self, i_imp=None, n_epi=None, inc_values=None,
+                 eliminate=False):
+        '''
+        Incompleteness-conditioned aleatory probability weights for one
+        Imprecision hypercube. This is the single internal weight source of
+        all processing paths -- injected estimator functions and evaluators
+        are *called with* these weights, they never compute them themselves.
+
+        The secondary Incompleteness variables are frozen either at their
+        sampled values of epistemic sample n_epi (path 'fast_build':
+        "Incompleteness sampling") or at the candidate values inc_values
+        (optimize_inc: path 'full' internal statistic and path
+        'fast_posthoc' re-weighting), then the renormalized aleatory pdf is
+        evaluated on the primary aleatory samples (probabilities_imp).
+
+        eliminate: bool
+            Apply the per-hypercube weight elimination of Imprecision
+            variables whose active focal bounds are secondary-Variability
+            samples (requires n_epi): aleatory samples whose realized focal
+            does not cover the epistemic sample's value of that variable
+            receive zero weight. A no-op when no such variables exist.
+            Not applied in optimize_inc, matching the original behavior.
+        '''
+        if inc_values is not None:
+            for var, value in zip(self.vars_inc, inc_values):
+                var.freeze(value)
+        elif n_epi is not None:
+            for var in self.vars_inc:
+                var.freeze(self.inp_suppl_epi[var.name].iloc[n_epi])
+
+        with HiddenPrints():
+            weights = self.probabilities_imp(i_imp)
+
+        if eliminate:
+            assert i_imp is not None and n_epi is not None
+            N_mcs_ale = self.N_mcs_ale
+            mask = np.ones(N_mcs_ale, dtype=bool)
+            hypercube = self.imp_hyc_foc_inds[i_imp]
+            for var, i_foc in zip(self.vars_imp, hypercube):
+                if not isinstance(var, MassFunction):
+                    continue
+                incvar, lbound, ubound = var._focals[i_foc]
+                nested = isinstance(lbound, UncertainVariable) or \
+                    isinstance(ubound, UncertainVariable)
+                if not nested:
+                    continue
+                if var.incremental or isinstance(incvar, UncertainVariable):
+                    raise NotImplementedError(
+                        f'Weight elimination for incremental variable '
+                        f'{var.name} with nested focal bounds is not '
+                        f'implemented.')
+                value = self.inp_samp_prim[var.name].iloc[n_epi]
+                if isinstance(lbound, UncertainVariable):
+                    low = self.inp_suppl_ale[lbound.name].values[:N_mcs_ale]
+                else:
+                    low = lbound
+                if isinstance(ubound, UncertainVariable):
+                    high = self.inp_suppl_ale[ubound.name].values[:N_mcs_ale]
+                elif np.isnan(ubound):  # singleton at the drawn lower bound
+                    high = low
+                else:
+                    high = ubound
+                mask &= (value >= low) & (value <= high)
+            weights = weights * mask
+            total = np.sum(weights)
+            if total <= 0:
+                raise ValueError(f'All weights eliminated in hypercube '
+                                 f'{i_imp} at epistemic sample {n_epi}.')
+            weights = weights / total
+
+        return weights
+
+    @staticmethod
+    def kish_n_eff(weights):
+        '''Kish effective sample size of a normalized weight vector.'''
+        weights = np.asarray(weights, dtype=np.float64)
+        weights = weights / np.sum(weights)
+        return 1.0 / np.sum(weights ** 2)
+
     def estimate_imp(self, interp_fun='rbf', opt_meth='genetic',
                      plot_res=False, plot_intp=False, print_res_ranges=False,
                      intp_err_warn=10,  # threshold in percent of interpolation domain
                      extrp_warn=5,  # threshold in percent of interpolation domain
+                     hyc_rows=None,
                      ** kwargs):
 
         '''    
@@ -1628,10 +1686,18 @@ class PolyUQ(object):
                 Issue a warning if interpolator cross-validation error exceeds
                 the given threshold in percent of the output variable range
             extrp_warn: float (0...100)
-                 Issue a warning if interpolator is extrapolating by the given 
+                 Issue a warning if interpolator is extrapolating by the given
                  percentage outside of the output variable range in the obtained
                  optimum interval. However, extrapolations will always be replaced
                  by the minimum / maximum output value.
+            hyc_rows: array-like (n_imp_hyc,), optional
+                Statistic-level instances only (fast paths): out_samp row
+                each Imprecision hypercube optimizes on -- one surrogate per
+                distinct row, hypercube q restricted to the surrogate of its
+                own (weight-dependent) statistic row (see stat_rows). The
+                per-row results are gathered into a single output row
+                (imp_foc shape (1, n_imp_hyc, 2)); previous imp_foc results
+                are discarded, not continued.
             **kwargs: dict
                 Extra keywords passed to interp_fun, optimizer or used at various
                 places in the code for evaluation purposes.
@@ -1772,6 +1838,15 @@ class PolyUQ(object):
             N_mcs_imp = 1
             # should be zero, but that would make hypercube_sample_indices empty
 
+        if hyc_rows is not None:
+            hyc_rows = np.asarray(hyc_rows, dtype=int)
+            assert len(hyc_rows) == n_imp_hyc
+            assert np.all((hyc_rows >= 0) & (hyc_rows < N_mcs_ale))
+            # per-hypercube rows collapse into a single result row: one-shot,
+            # previous results cannot be continued
+            self.imp_foc = None
+            self.val_samp_prim = None
+
         if interp_fun in ['nearest', 'linear', 'rbf']:
             interp_fun = {'nearest': scipy.interpolate.NearestNDInterpolator,
                           'linear': scipy.interpolate.LinearNDInterpolator,
@@ -1887,10 +1962,9 @@ class PolyUQ(object):
                 #    (pre-computed epistemic samples may be the same for each aleatory sample while only imprecise input boundaries differ)
                 if logger.isEnabledFor(logging.DEBUG): logger.debug(f'At sample {n_ale} out of {N_mcs_ale}')
 
-                if loop_ale:
-                    this_out = out_samp[n_ale,:N_mcs_imp]
-                else:
-                    this_out = out_samp[0,:N_mcs_imp]
+                # multi-row statistic-level instances (bound-row pairs,
+                # hyc_rows) iterate their rows even without an aleatory loop
+                this_out = out_samp[n_ale if out_samp.shape[0] > 1 else 0,:N_mcs_imp]
 
                 sparse_inds = ~np.isnan(this_out)
                 N_mcs_sparse = np.sum(sparse_inds)
@@ -1990,6 +2064,10 @@ class PolyUQ(object):
                 if logger.isEnabledFor(logging.DEBUG): logger.debug(f'{numeric_focals}, {vars_imp}, {imp_hyc_foc_inds}')
                 # palette = sns.color_palette(n_colors=n_imp_hyc)
                 for i_hyc, hypercube in enumerate(imp_hyc_foc_inds):
+                    if hyc_rows is not None and hyc_rows[i_hyc] != n_ale:
+                        # this hypercube optimizes on another statistic row
+                        pbar()
+                        continue
                     # get focal sets / intervals
                     if hypercube:
                         focals = np.vstack([focals[ind,:] for focals, ind in zip(numeric_focals, hypercube)])
@@ -2210,6 +2288,14 @@ class PolyUQ(object):
                 if logger.isEnabledFor(logging.DEBUG): logger.debug(f'Took {time.time()-now:1.2f} s for interval optimization of all {n_imp_hyc} hypercubes.')
                 if logger.isEnabledFor(logging.DEBUG): logger.debug(imp_foc[n_ale,:,:])
 
+        if hyc_rows is not None:
+            # gather each hypercube's result from its own statistic row into
+            # a single output row
+            imp_foc = np.stack([imp_foc[hyc_rows[i_hyc], i_hyc,:]
+                                for i_hyc in range(n_imp_hyc)])[np.newaxis,:,:]
+            val_samp_prim = np.stack([val_samp_prim[hyc_rows[i_hyc], i_hyc,:,:]
+                                      for i_hyc in range(n_imp_hyc)])[np.newaxis,:,:,:]
+
         self.imp_foc = imp_foc
         self.val_samp_prim = val_samp_prim
 
@@ -2224,9 +2310,48 @@ class PolyUQ(object):
 
         return imp_foc, val_samp_prim, intp_errors, intp_exceed, intp_undershot
 
-    def optimize_inc(self, stat_fun, n_stat, stat_fun_kwargs={}):
+    def stat_eval(self, weights, stat_fun, i_imp_hyc, sort_ind, i_stat,
+                  min_max, stat_fun_kwargs={}):
+        '''
+        Default Variability-statistic evaluator (path 'full'): evaluate the
+        weighted statistic stat_fun on both bound surfaces of the
+        Imprecision focals (imp_foc) of hypercube i_imp_hyc, using the
+        provided aleatory probability weights. Formerly a closure inside
+        optimize_inc; promoted so that optimize_inc can alternatively drive
+        an injected external evaluator (path 'fast_posthoc') with the same
+        internally computed weights.
+        '''
+        imp_foc = self.imp_foc
+
+        stat_vals = np.empty(2)
+        for bound in range(2):
+            stat_vals[bound] = stat_fun(imp_foc[sort_ind[:, bound], i_imp_hyc, bound], weights[sort_ind[:, bound]], i_stat, min_max, **stat_fun_kwargs)  # min
+        logger.debug(stat_vals)
+        return stat_vals
+
+    def optimize_inc(self, stat_fun=None, n_stat=None, stat_fun_kwargs={},
+                     evaluator=None):
 
         '''
+        Incompleteness interval optimization driver: for each statistic and
+        each (Imprecision x Incompleteness) hypercube, optimize the
+        Incompleteness variable values within their focal bounds to
+        extremize the statistic. The candidate Incompleteness values are
+        frozen and the aleatory probability weights computed *inside* this
+        driver (self._weights); the statistic evaluation is pluggable:
+
+        evaluator is None (path 'full'):
+            self.stat_eval evaluates stat_fun over the weighted Imprecision
+            focals imp_foc (requires estimate_imp results).
+        evaluator given (path 'fast_posthoc'):
+            called as evaluator(weights, i_imp_hyc, i_stat, min_max,
+            **stat_fun_kwargs); returns one or more candidate statistic
+            values (nanmin/nanmax is taken over them), e.g. a re-weighted
+            OMA statistic (apply_block_weights -> mean/variance -> CDF
+            value). Callers close over any external identification data
+            (e.g. the cached variance factors of one pole) and typically
+            call optimize_inc once per pole.
+
         stat_fun must accept the following arguments:
                 samples, p_weights, i_stat, minmax
             i_stat: the index of the statistic for multivalued statistics, e.g the number of a histogram bin
@@ -2234,22 +2359,22 @@ class PolyUQ(object):
             stat_fun_kwargs: to provide additional kwargs, e.g. histogram bins 
         '''
 
-        def stat_eval(x, stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_opt, min_max, stat_fun_kwargs):
+        if evaluator is None and stat_fun is None:
+            raise ValueError('Either stat_fun or an external evaluator is required.')
+        if n_stat is None:
+            raise ValueError('n_stat is required.')
 
-            for i, var in enumerate(vars_opt):
-                var.freeze(x[i])
-            p_weights = self.probabilities_imp(i_imp_hyc)
-            # samp = imp_foc[sort_ind]
+        def _eval(x, i_imp_hyc, sort_ind, i_stat, min_max):
+            # freeze the Incompleteness candidate and compute the weights
+            # here -- the (internal or injected) evaluator only consumes them
+            weights = self._weights(i_imp=i_imp_hyc, inc_values=x)
+            if evaluator is None:
+                return self.stat_eval(weights, stat_fun, i_imp_hyc, sort_ind,
+                                      i_stat, min_max, stat_fun_kwargs)
+            return np.atleast_1d(evaluator(weights, i_imp_hyc, i_stat,
+                                           min_max, **stat_fun_kwargs))
 
-            stat_vals = np.empty(2)
-            for bound in range(2):
-                stat_vals[bound] = stat_fun(imp_foc[sort_ind[:, bound], i_imp_hyc, bound], p_weights[sort_ind[:, bound]], i_stat, min_max, **stat_fun_kwargs)  # min
-            # # high boundary
-            # stat_vals[1] = stat_fun(samp[:, 1], p_weights[sort_ind[:,1]], i_stat,  min_max, **stat_fun_kwargs) # min
-            logger.debug(stat_vals)
-            return stat_vals
-
-        def interval_range(x, stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_opt, n_vars_opt, stat_fun_kwargs,):
+        def interval_range(x, i_imp_hyc, sort_ind, i_stat, n_vars_opt):
                     #        x, interp, temp_x, unit_bounds, temp_dists,
                     # **kwargs):
             '''
@@ -2267,12 +2392,12 @@ class PolyUQ(object):
             nevertheless it might be needed for verification purposes
             '''
 
-            stat_vals = stat_eval(x[:n_vars_opt], stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_opt, 1, stat_fun_kwargs)
+            stat_vals = _eval(x[:n_vars_opt], i_imp_hyc, sort_ind, i_stat, 1)
             if np.all(np.isnan(stat_vals)):
                 return 0
             stat_min = np.nanmin(stat_vals)
 
-            stat_vals = stat_eval(x[n_vars_opt:], stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_opt, -1, stat_fun_kwargs)
+            stat_vals = _eval(x[n_vars_opt:], i_imp_hyc, sort_ind, i_stat, -1)
             if np.all(np.isnan(stat_vals)):
                 return 0
             stat_max = np.nanmax(stat_vals)
@@ -2335,13 +2460,16 @@ class PolyUQ(object):
                     # bounds = [focs[ind] for focs, ind in zip(numeric_focals, inc_hyc_foc_inds[i_inc_hyc])]
                     init = np.mean(bounds, axis=1, keepdims=True)  # (n_vars_inc, 1)
 
-                    sort_ind = np.argsort(imp_foc[:N_mcs_ale, i_imp_hyc,:], axis=0)
-                    # remove nans from array by removing respective indices
-                    mask = np.any(~np.take_along_axis(np.isnan(imp_foc[:N_mcs_ale, i_imp_hyc,:]),
-                                                      sort_ind,
-                                                      axis=0),
-                                  axis=1)
-                    sort_ind = sort_ind[mask,:]
+                    if evaluator is None:
+                        sort_ind = np.argsort(imp_foc[:N_mcs_ale, i_imp_hyc,:], axis=0)
+                        # remove nans from array by removing respective indices
+                        mask = np.any(~np.take_along_axis(np.isnan(imp_foc[:N_mcs_ale, i_imp_hyc,:]),
+                                                          sort_ind,
+                                                          axis=0),
+                                      axis=1)
+                        sort_ind = sort_ind[mask,:]
+                    else:
+                        sort_ind = None
 
                     now = time.time()
                     for i_stat in range(n_stat):
@@ -2349,7 +2477,7 @@ class PolyUQ(object):
                         logging.disable(logging.INFO)
                         if n_inc_hyc > 1:
                             resl = scipy.optimize.minimize(fun=interval_range, x0=np.squeeze(np.vstack((init, init))),  # (2 * n_vars_inc, 1)
-                                                args=(stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_inc, n_vars_inc, stat_fun_kwargs),
+                                                args=(i_imp_hyc, sort_ind, i_stat, n_vars_inc),
                                                 bounds=np.vstack((bounds, bounds)))
                             if not resl.success:
                                 logger.warning(f'Optimizer failed for hypercube {i_hyc} at i_stat {i_stat} with message {resl.message}. Breaking here.')
@@ -2360,8 +2488,8 @@ class PolyUQ(object):
                             x_low = bounds[:, 0]
                             x_up = bounds[:, 1]
 
-                        out_low = stat_eval(x_low, stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_inc, 1, stat_fun_kwargs)
-                        out_up = stat_eval(x_up, stat_fun, imp_foc, i_imp_hyc, sort_ind, i_stat, vars_inc, -1, stat_fun_kwargs)
+                        out_low = _eval(x_low, i_imp_hyc, sort_ind, i_stat, 1)
+                        out_up = _eval(x_up, i_imp_hyc, sort_ind, i_stat, -1)
 
                         logging.disable(logging.NOTSET)
                         focals_stats[i_stat, i_hyc, 0] = np.nanmin(out_low)
@@ -2419,6 +2547,143 @@ class PolyUQ(object):
         self.focals_mass = hyc_mass
 
         return focals_stats, hyc_mass
+
+    @staticmethod
+    def _primary_copy(var):
+        '''
+        Fresh primary=True MassFunction with the focal sets and masses of
+        ``var``: lifts the secondary epistemic variables into the
+        statistic-level instance, where their focal products become part of
+        the combined (Imprecision x Incompleteness) hypercube grid.
+        '''
+        if not isinstance(var, MassFunction):
+            raise NotImplementedError(
+                f'Statistic-level lifting is only implemented for '
+                f'MassFunction variables, got {type(var).__name__} for '
+                f'{var.name}.')
+        focals = []
+        for _, low, high in var._focals:
+            if isinstance(high, float) and np.isnan(high):
+                focals.append((low,))
+            else:
+                focals.append((low, high))
+        var_copy = MassFunction(var.name, focals,
+                                np.array(var.masses, dtype=float).ravel(),
+                                primary=True)
+        var_copy.pretty_name = getattr(var, 'pretty_name', var.name)
+        return var_copy
+
+    def to_statistic_level(self, out_rows, out_name='theta', include_inc=True):
+        '''
+        Build the statistic-level PolyUQ instance (ENTRY point of the fast
+        paths, after external clustering): all epistemic variables of this
+        instance are lifted to primary variables of a fresh instance (the
+        sampled values of the secondary Incompleteness variables become
+        surrogate coordinates, their focal products part of the combined
+        hypercube grid), and the externally computed statistic rows become
+        its output samples for estimate_imp.
+
+        Parameters:
+        -----------
+            out_rows: array-like (n_rows, N_mcs_epi)
+                Statistic values per epistemic sample (NaN where a mode was
+                not found), typically assembled by stat_rows. A single row
+                for a scalar statistic; one row per hypercube group for
+                weight-dependent statistics (pass the matching hyc_rows to
+                estimate_imp); or a [lower, upper] row pair from a preceding
+                optimize_inc(evaluator=...) run (path 'fast_posthoc'; see
+                combine_bound_rows).
+            out_name: str
+            include_inc: bool
+                Lift the secondary Incompleteness variables too (path
+                'fast_build', where their sampled values conditioned the
+                weights and their focals span the combined hypercube grid).
+                Pass False on path 'fast_posthoc', where Incompleteness was
+                already collapsed into the statistic bounds by
+                optimize_inc(evaluator=...) and only the Imprecision
+                variables remain to be optimized.
+
+        Returns:
+        --------
+            poly_uq: PolyUQ
+                Instance ready for estimate_imp.
+        '''
+        if include_inc:
+            vars_lift = list(self.vars_epi)
+        else:
+            vars_lift = list(self.vars_imp)
+        vars_stat = [self._primary_copy(var) for var in vars_lift]
+        inp_names_prim = [var.name for var in self.vars_imp]
+        inp_names_sec = [var.name for var in self.vars_inc] if include_inc else []
+        N_mcs_epi = self.N_mcs_epi
+        x_t = pd.concat(
+            [self.inp_samp_prim[inp_names_prim].iloc[:N_mcs_epi].reset_index(drop=True),
+             self.inp_suppl_epi[inp_names_sec].iloc[:N_mcs_epi].reset_index(drop=True)],
+            axis=1)
+
+        out_rows = np.atleast_2d(np.asarray(out_rows, dtype=np.float64))
+        if np.all(np.isnan(out_rows)):
+            raise ValueError('The statistic rows are all-NaN (e.g. a mode '
+                             'that was not found in any epistemic sample).')
+
+        return PolyUQ.from_propagated_samples(
+            vars_stat, x_t, out_rows, out_name=out_name,
+            multi_row=out_rows.shape[0] > 1)
+
+    def combine_bound_rows(self):
+        '''
+        For a statistic-level instance whose two output rows are the lower /
+        upper statistic bounds of a preceding Incompleteness optimization
+        (path 'fast_posthoc'): combine the two per-row focal surfaces of
+        estimate_imp into a single focal row [minimum of the lower-bound
+        surface, maximum of the upper-bound surface] -- the two-surrogate-
+        rows composition of C-optimized intervals into the Imprecision
+        result.
+
+        Returns:
+        --------
+            imp_foc: np.ndarray (1, n_imp_hyc, 2)
+        '''
+        if self.imp_foc is None or self.imp_foc.shape[0] != 2:
+            raise RuntimeError('combine_bound_rows requires estimate_imp '
+                               'results on exactly two output rows '
+                               '(lower / upper statistic bounds).')
+        return np.stack([self.imp_foc[0,:, 0], self.imp_foc[1,:, 1]],
+                        axis=-1)[np.newaxis,:,:]
+
+    def expand_hyc_rows(self, stat_poly_uq, hyc_rows):
+        '''
+        Map per-Imprecision-hypercube statistic-row indices of THIS
+        (sampling-level) instance onto the combined hypercube grid of a
+        statistic-level instance built by to_statistic_level: each combined
+        hypercube inherits the row of the sampling-level hypercube whose
+        focal choices it shares in this instance's Imprecision variables
+        (order-agnostic; the lifted Incompleteness focals only multiply the
+        grid).
+
+        Parameters:
+        -----------
+            stat_poly_uq: PolyUQ
+                The statistic-level instance (from to_statistic_level).
+            hyc_rows: array-like (len(self.imp_hyc_foc_inds),)
+                Row index per sampling-level Imprecision hypercube (from
+                stat_rows or an equivalent dedupe).
+
+        Returns:
+        --------
+            hyc_rows_combined: np.ndarray (len(stat_poly_uq.imp_hyc_foc_inds),)
+                Pass to stat_poly_uq.estimate_imp(hyc_rows=...).
+        '''
+        hyc_rows = np.asarray(hyc_rows, dtype=int)
+        parent_names = [var.name for var in self.vars_imp]
+        stat_names = [var.name for var in stat_poly_uq.vars_imp]
+        pos = [stat_names.index(name) for name in parent_names]
+        parent_map = {tuple(hyc): i_hyc for i_hyc, hyc
+                      in enumerate(self.imp_hyc_foc_inds)}
+        combined = np.empty(len(stat_poly_uq.imp_hyc_foc_inds), dtype=int)
+        for i_comb, hyc in enumerate(stat_poly_uq.imp_hyc_foc_inds):
+            combined[i_comb] = hyc_rows[parent_map[tuple(hyc[p] for p in pos)]]
+        return combined
 
     def estimate_sensi(self, method='var', samp_sel='rand', y_resamples=None,
                        num_resamples=None, num_subdivisions=None):
@@ -2748,134 +3013,6 @@ class PolyUQ(object):
 
         return hyc_dat_inds
 
-    def naive_uq(self, N_mcs, mapping, arg_vars):
-
-        def imp_stat(x):
-            for i, var in enumerate(vars_inc):
-                var.freeze(x[i])
-            # print(x)
-            hypercube = imp_hyc_foc_inds[i_imp_hyc]
-
-            imp_foc = np.empty((N_mcs, 2))
-
-            rvs_ale = np.empty((len(vars_ale), N_mcs))
-            for i, var_ale in enumerate(vars_ale):
-                rvs_ale[i,:] = var_ale.rvs(size=N_mcs)
-
-            bound_vars = []
-            for i, (arg, var) in enumerate(arg_vars.items()):
-                for var_ale in vars_ale:
-                    if not var_ale.primary: continue
-                    if var_ale.name == var:
-                        bound_vars.append(var_ale)
-                        break
-                else:
-                    for j, var_imp in enumerate(vars_imp):
-                        if not var_imp.primary: continue
-                        if var_imp.name == var:
-                            bound_vars.append((var_imp, j))
-                            break
-                    else:
-                        raise RuntimeError(f'Could not find var {var} for argument {arg}, neither in {vars_imp} nor {vars_ale}')
-
-            for n_ale in range(N_mcs):
-                for i in range(len(vars_ale)):
-                    vars_ale[i].freeze(rvs_ale[i, n_ale])
-
-                bounds = np.zeros((len(arg_vars), 2))
-
-                for i in range(len(arg_vars)):
-                    if isinstance(bound_vars[i], RandomVariable):
-                        bounds[i,:] = bound_vars[i].value
-                    else:
-                        var_imp, j = bound_vars[i]
-                        bounds[i,:] = var_imp.numeric_focal(hypercube[j])
-
-                # init = [np.mean(bound) for bound in bounds]
-                # resl = scipy.optimize.minimize(lambda x:  mapping(*x), init, bounds=bounds)
-                # resu = scipy.optimize.minimize(lambda x: -mapping(*x), init, bounds=bounds)
-                #
-                # imp_foc[n_ale,:] = (resl.fun, -resu.fun)
-
-                imp_foc[n_ale,:] = mapping(bounds[0,:], bounds[1,:])
-
-            Pf = np.sum(imp_foc >= 260, axis=0) / N_mcs
-            # print(Pf)
-            return Pf
-
-        # Variables
-        vars_inc = self.vars_inc
-        vars_ale = self.vars_ale
-        vars_imp = self.vars_imp
-
-        # Epistemic Hypercubes
-        imp_hyc_foc_inds = self.imp_hyc_foc_inds  # no-imp: is a list containing a single empty tuple
-        n_imp_hyc = len(imp_hyc_foc_inds)  # no-imp: would be 1
-        imp_hyc_mass = self.imp_hyc_mass  # no-imp: is a list containing a single 1.0
-
-        inc_hyc_foc_inds = self.inc_hyc_foc_inds
-        n_inc_hyc = len(inc_hyc_foc_inds)
-        inc_hyc_mass = self.inc_hyc_mass
-        # no-inc: sizes are analogous to the no-imp case
-
-        n_hyc = n_imp_hyc * n_inc_hyc
-
-        n_stat = 1
-
-        num_focals_inc = [var.numeric_focals for var in vars_inc]
-
-        # compute belief functions for each statistic
-        focals_stats = np.empty((n_stat, n_hyc, 2))
-        hyc_mass = np.empty((n_hyc,))
-
-        if vars_inc:
-            # print(vars_inc)
-            pbar = simplePbar(n_imp_hyc * n_inc_hyc * n_stat)
-            for i_imp_hyc in range(n_imp_hyc):
-                for i_inc_hyc in range(n_inc_hyc):
-                    i_hyc = i_imp_hyc * n_inc_hyc + i_inc_hyc
-
-                    bounds = [focs[ind] for focs, ind in zip(num_focals_inc, inc_hyc_foc_inds[i_inc_hyc])]
-
-                    init = [np.mean(bound) for bound in bounds]
-                    for i_stat in range(n_stat):
-
-                        if np.all(np.diff(bounds, axis=1) == 0):  # complete variable
-                            focals_stats[i_stat, i_hyc,:] = imp_stat(init)
-                        else:
-
-                            '''
-                            optimizing a  stochastic objective requires carefully chosen initial guesses, as it is very noisy due to randomness
-                            '''
-                            initial_simplex = np.empty((5, 4))
-                            for i in range(2):
-                                for j in range(2):
-                                    initial_simplex[i * 2 + j,:] = [bounds[0][i], bounds[1][j], bounds[2][j], bounds[3][i]]
-                            initial_simplex[-1,:] = init
-                            # lower boundary
-                            # print(f'Minimizing within {bounds}')
-                            resll = scipy.optimize.minimize(lambda x: imp_stat(x)[0], init, options={'initial_simplex':initial_simplex}, method='Nelder-Mead', bounds=bounds)
-                            # resul = scipy.optimize.minimize(lambda x: -imp_stat(x)[0], init, bounds=bounds)
-                            # high boundary
-                            # reslu = scipy.optimize.minimize(lambda x:  imp_stat(x)[1], init, bounds=bounds)
-                            # print(f'Maximizing within {bounds}')
-                            resuu = scipy.optimize.minimize(lambda x:-imp_stat(x)[1], init, options={'initial_simplex':initial_simplex}, method='Nelder-Mead', bounds=bounds)
-
-                            # focals_stats[i_stat, i_hyc, 0] = min( resll.fun,  reslu.fun)
-                            # focals_stats[i_stat, i_hyc, 1] = max(-resul.fun, -resuu.fun)
-                            focals_stats[i_stat, i_hyc,:] = (resll.fun, resuu.fun)
-
-                        next(pbar)
-
-                hyc_mass[i_imp_hyc * n_inc_hyc: (i_imp_hyc + 1) * n_inc_hyc ] = inc_hyc_mass * imp_hyc_mass[i_imp_hyc]
-        else:  # no incompleteness
-            for i_imp_hyc in range(n_imp_hyc):
-                stat = imp_stat(None)
-                focals_stats[:, i_imp_hyc,:] = stat
-            hyc_mass = imp_hyc_mass
-
-        return focals_stats, hyc_mass
-
     def save_state(self, fname, differential=None):
         # differential: samp, prop, imp, inc
 
@@ -2914,7 +3051,6 @@ class PolyUQ(object):
                 out_dict['self.inp_suppl_epi.columns'] = self.inp_suppl_epi.columns
             else:
                 out_dict['self.inp_suppl_epi.columns'] = None
-            out_dict['self.stoch_weights'] = self.stoch_weights
 
         if differential is None or differential == 'prop':
             out_dict['self.fcount'] = self.fcount
@@ -2929,10 +3065,6 @@ class PolyUQ(object):
             out_dict['self.intp_errors'] = self.intp_errors
             out_dict['self.intp_exceed'] = self.intp_exceed
             out_dict['self.intp_undershot'] = self.intp_undershot
-
-        if differential is None or differential == 'stoch':
-            out_dict['self.stoch_mass'] = self.stoch_mass
-            out_dict['self.stoch_stats'] = self.stoch_stats
 
         if differential is None or differential == 'inc':
             out_dict['self.focals_stats'] = self.focals_stats
@@ -3004,8 +3136,6 @@ class PolyUQ(object):
             self.inp_suppl_epi = to_dataframe(validate_array(in_dict['self.inp_suppl_epi']),
                                               validate_array(in_dict['self.inp_suppl_epi.columns']))
 
-            self.stoch_weights = validate_array(in_dict.get('self.stoch_weights'))
-
         if differential is None or differential == 'prop':
             self.fcount = validate_array(in_dict['self.fcount'])
             self.out_name = validate_array(in_dict.get('self.out_name'))
@@ -3019,10 +3149,6 @@ class PolyUQ(object):
             self.intp_errors = validate_array(in_dict.get('self.intp_errors'))
             self.intp_exceed = validate_array(in_dict.get('self.intp_exceed'))
             self.intp_undershot = validate_array(in_dict.get('self.intp_undershot'))
-
-        if differential is None or differential == 'stoch':
-            self.stoch_mass = validate_array(in_dict.get('self.stoch_mass'))
-            self.stoch_stats = validate_array(in_dict.get('self.stoch_stats'))
 
         if differential is None or differential == 'inc':
             self.focals_stats = validate_array(in_dict['self.focals_stats'])
