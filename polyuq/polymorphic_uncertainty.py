@@ -276,8 +276,9 @@ class MassFunction(UncertainVariable):
 
         def get_dtype_num(val):
             if isinstance(val, UncertainVariable):
-                # dtype is inferred from the nested variable itself, not here
-                return -1
+                # dtype is inferred from the nested variable itself
+                nested_dtype = getattr(val, 'dtype', None)
+                return {bool: 0, int: 1, float: 2, complex: 3}.get(nested_dtype, -1)
             if np.isnan(val):
                 return -1
             if isinstance(val, np.bool_):
