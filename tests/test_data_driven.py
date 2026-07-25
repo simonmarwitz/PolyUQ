@@ -28,11 +28,20 @@ def _skip_if_missing(*paths):
             pytest.skip(f"Required file not found: {p}")
 
 
-def _oma_uq_examples_dir():
-    # Public convention: PolyUQ and oma_uq cloned as sibling repos.
-    # Override with OMA_UQ_PATH for other layouts.
-    root = Path(os.environ.get("OMA_UQ_PATH", Path(__file__).parent.parent.parent / "oma_uq"))
-    return root / "examples"
+def _oma_uq_root():
+    """Repo root of the companion application layer (pyoma-uq).
+
+    Public convention: PolyUQ and pyoma-uq cloned as sibling repos; override
+    with OMA_UQ_PATH for other layouts. Returns the root rather than the study
+    directory, because the studies import each other as ``pyoma_uq.studies.*``
+    and so need the root itself on sys.path.
+    """
+    return Path(os.environ.get("OMA_UQ_PATH",
+                               Path(__file__).parent.parent.parent / "pyoma-uq"))
+
+
+def _oma_uq_available():
+    return (_oma_uq_root() / "pyoma_uq" / "studies").is_dir()
 
 
 @pytest.fixture(scope="module")
@@ -40,8 +49,8 @@ def vars_stage3():
     """Load vars_definition(stage=3) from oma_uq."""
     if not os.environ.get("POLYUQ_DATA_DIR", ""):
         pytest.skip("POLYUQ_DATA_DIR not set — skipping data-driven tests")
-    sys.path.insert(0, str(_oma_uq_examples_dir()))
-    from UQ_OMA import vars_definition
+    sys.path.insert(0, str(_oma_uq_root()))
+    from pyoma_uq.studies.UQ_OMA import vars_definition
     vars_ale, vars_epi, _ = vars_definition(stage=3)
     return vars_ale, vars_epi
 

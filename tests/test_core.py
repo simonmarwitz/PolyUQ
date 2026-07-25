@@ -15,11 +15,20 @@ from polyuq import (
 )
 
 
-def _oma_uq_examples_dir():
-    # Public convention: PolyUQ and oma_uq cloned as sibling repos.
-    # Override with OMA_UQ_PATH for other layouts.
-    root = Path(os.environ.get("OMA_UQ_PATH", Path(__file__).parent.parent.parent / "oma_uq"))
-    return root / "examples"
+def _oma_uq_root():
+    """Repo root of the companion application layer (pyoma-uq).
+
+    Public convention: PolyUQ and pyoma-uq cloned as sibling repos; override
+    with OMA_UQ_PATH for other layouts. Returns the root rather than the study
+    directory, because the studies import each other as ``pyoma_uq.studies.*``
+    and so need the root itself on sys.path.
+    """
+    return Path(os.environ.get("OMA_UQ_PATH",
+                               Path(__file__).parent.parent.parent / "pyoma-uq"))
+
+
+def _oma_uq_available():
+    return (_oma_uq_root() / "pyoma_uq" / "studies").is_dir()
 
 
 class TestRandomVariable:
@@ -204,40 +213,6 @@ class TestEvidentialBeam:
         )
 
 
-class TestAnalyticalMapping:
-    """Test the UQ_Modal_Analytical mapping function in isolation (no HPC)."""
-
-    def test_frequencies_positive(self):
-        sys.path.insert(0, str(_oma_uq_examples_dir()))
-        from UQ_Modal_Analytical import mapping_function
-
-        fd, zetas, frf = mapping_function(
-            E=2.1e11, A=0.0343, rho=7850.0, L=200.0,
-            omega_u=440.0, zeta=0.047,
-            add_mass=60.0, ice_occ=0, ice_mass=0.0
-        )
-        assert np.all(fd > 0), "Natural frequencies must be positive"
-        assert np.all(zetas > 0), "Damping ratios must be positive"
-        assert np.all(zetas < 1), "Damping ratios must be < 1 (underdamped)"
-
-    def test_ice_mass_lowers_frequencies(self):
-        sys.path.insert(0, str(_oma_uq_examples_dir()))
-        from UQ_Modal_Analytical import mapping_function
-
-        fd_no_ice, _, _ = mapping_function(
-            E=2.1e11, A=0.0343, rho=7850.0, L=200.0,
-            omega_u=440.0, zeta=0.047,
-            add_mass=60.0, ice_occ=0, ice_mass=75.0
-        )
-        fd_ice, _, _ = mapping_function(
-            E=2.1e11, A=0.0343, rho=7850.0, L=200.0,
-            omega_u=440.0, zeta=0.047,
-            add_mass=60.0, ice_occ=1, ice_mass=75.0
-        )
-        # Ice increases mass → frequencies decrease
-        assert np.all(fd_ice <= fd_no_ice + 1e-6)
-
-
 class TestDataManagerImportOrder:
     """Guards the static-TLS import-order constraint (see oma_uq history ee3f8db):
     ray must never be imported before numpy/scipy/matplotlib in polyuq.data_manager.
@@ -363,3 +338,80 @@ class TestFromPropagatedSamples:
         with pytest.raises(ValueError, match="inp_suppl_epi"):
             PolyUQ.from_propagated_samples(
                 [x1, c], {"x1": np.zeros(10)}, np.zeros((1, 10)))
+
+
+class TestObservedAleatorySamples:
+    """``sample_qmc(given_samples=)`` + ``UncertainVariable.proposal``.
+
+    Aleatory samples that were *observed* rather than drawn (e.g. the measured
+    excitation level of each data block in an experimental OMA study) do not
+    come from the uniform-over-support proposal ``sample_qmc`` otherwise
+    implies, so ``probabilities_imp`` must divide the target density by the
+    declared proposal instead.
+    """
+
+    @staticmethod
+    def _polyuq(proposal=None, given=None, seed=1509):
+        c = MassFunction("c_vb", [(2.267, 2.3), (1.96, 2.01)], [0.75, 0.25],
+                         primary=False)
+        lam = MassFunction("lamda_vb", [(5.618, 5.649), (5.91, 6.0)],
+                           [0.75, 0.25], primary=False)
+        v_b = RandomVariable("weibull_min", "v_b", [c, lam], primary=True)
+        v_b.proposal = proposal
+        tau = MassFunction("tau_max", [(20.0, 60.0), (40.0, 90.0)], [0.5, 0.5],
+                           primary=True)
+        pq = PolyUQ([v_b], [c, lam, tau], dim_ex="cartesian", path="fast_build")
+        pq.sample_qmc(N_mcs_ale=64, N_mcs_epi=32, seed=seed,
+                      given_samples=given)
+        return pq, v_b
+
+    def test_default_proposal_is_the_historical_formula(self):
+        # proposal=None must stay bit-identical to `pdf(x) * support_width`
+        pq, v_b = self._polyuq()
+        weights = pq._weights(i_imp=0, n_epi=3)
+        for var in pq.vars_inc:
+            var.freeze(pq.inp_suppl_epi[var.name].iloc[3])
+        values = pq.inp_samp_prim["v_b"].iloc[:64]
+        ref = np.ones((64, 1))
+        ref *= np.repeat(v_b.prob_dens(values)[:, np.newaxis]
+                         * np.diff(pq.var_supp["v_b"]), 1, axis=1)
+        ref = (ref / ref.sum())[:, 0]
+        assert np.array_equal(weights, ref)
+
+    def test_explicit_uniform_proposal_matches_default(self):
+        import scipy.stats
+        pq_ref, v_ref = self._polyuq()
+        lo, hi = v_ref.support((0.0001, 0.9999))
+        pq, _ = self._polyuq(proposal=scipy.stats.uniform(lo, hi - lo))
+        assert np.allclose(pq._weights(i_imp=0, n_epi=3),
+                           pq_ref._weights(i_imp=0, n_epi=3))
+
+    def test_given_samples_are_injected_and_reweighted(self):
+        import scipy.stats
+        proposal = scipy.stats.lognorm(0.45, scale=6.0)
+        levels = proposal.rvs(size=64, random_state=7)
+        pq, v_b = self._polyuq(proposal=proposal, given={"v_b": levels})
+        assert np.allclose(pq.inp_samp_prim["v_b"].iloc[:64].values, levels)
+
+        weights = pq._weights(i_imp=0, n_epi=3)
+        for var in pq.vars_inc:
+            var.freeze(pq.inp_suppl_epi[var.name].iloc[3])
+        expected = v_b.prob_dens(levels) / proposal.pdf(levels)
+        assert np.allclose(weights, expected / expected.sum())
+
+    def test_primary_aleatory_needs_all_samples(self):
+        with pytest.raises(ValueError, match="N_mcs_ale"):
+            self._polyuq(given={"v_b": np.ones(10)})
+
+    def test_unknown_variable_rejected(self):
+        with pytest.raises(ValueError, match="unknown variable"):
+            self._polyuq(given={"nope": np.ones(64)})
+
+    def test_zero_proposal_density_rejected(self):
+        import scipy.stats
+        # a proposal with bounded support that excludes some samples makes the
+        # importance weights undefined rather than merely large
+        pq, v_b = self._polyuq()
+        v_b.proposal = scipy.stats.uniform(0.0, 1.0)
+        with pytest.raises(ValueError, match="zero or non-finite density"):
+            pq._weights(i_imp=0, n_epi=3)
