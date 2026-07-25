@@ -100,6 +100,12 @@ class UncertainVariable(object):
         self.name = name
         self.pretty_name = name
         self.primary = primary
+        # Sampling (proposal) distribution the variable's samples were actually
+        # drawn from. None (the default) means the uniform distribution over the
+        # truncated support that sample_qmc draws from; set it when the samples
+        # come from elsewhere, e.g. observed data injected with
+        # sample_qmc(given_samples=...). See _proposal_factor.
+        self.proposal = None
 
         for child in children:
             if isinstance(child, UncertainVariable):
@@ -109,6 +115,58 @@ class UncertainVariable(object):
             is_poly = False
 
         self.is_poly = is_poly
+
+    def proposal_dens(self, values):
+        '''
+        Density of the sampling (proposal) distribution at *values*.
+
+        Only defined once :attr:`proposal` is set -- either a frozen
+        ``scipy.stats`` distribution (anything with a ``pdf``) or a callable
+        mapping values to densities. Without it the proposal is the uniform
+        distribution over the truncated support, which is handled directly in
+        :meth:`_proposal_factor` because the support is not known here.
+        '''
+        if self.proposal is None:
+            raise RuntimeError(
+                f'Variable {self.name} has no explicit proposal distribution; '
+                'its samples are assumed uniform over the truncated support.')
+        values = np.asarray(values, dtype=np.float64)
+        if hasattr(self.proposal, 'pdf'):
+            dens = np.asarray(self.proposal.pdf(values), dtype=np.float64)
+        elif callable(self.proposal):
+            dens = np.asarray(self.proposal(values), dtype=np.float64)
+        else:
+            raise TypeError(
+                f'The proposal of variable {self.name} must be a frozen '
+                'scipy.stats distribution or a callable, got '
+                f'{type(self.proposal).__name__}.')
+        if dens.shape != values.shape:
+            raise ValueError(
+                f'The proposal of variable {self.name} returned {dens.shape} '
+                f'densities for {values.shape} values.')
+        return dens
+
+    def _proposal_factor(self, values, supp):
+        '''
+        The importance-weight factor ``1 / q(x)`` of the sampling distribution
+        ``q``, by which probabilities_imp divides the target density.
+
+        With no explicit :attr:`proposal` the samples come from sample_qmc,
+        which draws primary variables uniformly over the truncated support, so
+        the factor is the constant support width. It is returned as that width
+        rather than as ``1 / (1 / width)`` so that the arithmetic stays
+        bit-identical to the historical ``* np.diff(var_supp[name])``.
+        '''
+        if self.proposal is None:
+            return np.diff(supp)
+        dens = self.proposal_dens(values)
+        if np.any(~np.isfinite(dens)) or np.any(dens <= 0):
+            raise ValueError(
+                f'The proposal of variable {self.name} assigns zero or '
+                'non-finite density to at least one of its samples, so the '
+                'importance weights are undefined. Widen the proposal or drop '
+                'the offending samples.')
+        return 1.0 / dens
 
     def support(self,):
         '''
@@ -712,7 +770,7 @@ class PolyUQ(object):
         return all_vars
 
     def sample_qmc(self, N_mcs_ale=100000, N_mcs_epi=1000, percentiles=(0.0001, 0.9999),
-                   check_discr='auto', seed=None, **kwargs):
+                   check_discr='auto', seed=None, given_samples=None, **kwargs):
         '''
         A function to generate quasi Monte Carlo samples for mixed aleatory-epistemic uncertainty quantification
         
@@ -764,6 +822,18 @@ class PolyUQ(object):
             check_sample_size: bool
                 Whether to check the sample sizes for approximation of each epistemic
                 hypercube (might be time consuming for a high number of stochastic samples)
+            given_samples: dict, optional
+                Mapping ``{variable name: values}`` of samples that are *given*
+                rather than drawn -- typically observed data, e.g. the measured
+                excitation level of each data block in an experimental study.
+                The drawn column is overwritten in its first ``len(values)``
+                rows; for a primary aleatory variable that must be all
+                ``N_mcs_ale`` of them. Since such samples do not come from the
+                uniform-over-support proposal this method otherwise implies,
+                set the variable's ``proposal`` (see
+                :meth:`UncertainVariable.proposal_dens`) as well, or the
+                importance weights of :meth:`probabilities_imp` will be biased
+                by the true sampling density.
         '''
         vars_epi = self.vars_epi
         vars_ale = self.vars_ale
@@ -872,6 +942,10 @@ class PolyUQ(object):
             else:
                 samples[var.name] = this_samples.astype(var.dtype)
 
+        if given_samples:
+            self._substitute_given_samples(samples, given_samples, all_vars,
+                                           var_supp, N_mcs_ale)
+
         logger.debug('Finalizing...')
         inp_samp_prim = samples[[var.name for var in all_vars_prim]]  # variability and imprecision
         inp_suppl_ale = samples.iloc[:N_mcs_ale][[var.name for var in vars_ale if not var.primary]]  # variability -> imprecision
@@ -897,6 +971,58 @@ class PolyUQ(object):
         self.inp_suppl_epi = inp_suppl_epi
 
         return
+
+    def _substitute_given_samples(self, samples, given_samples, all_vars,
+                                  var_supp, N_mcs_ale):
+        '''
+        Overwrite drawn sample columns with externally given values, in place.
+
+        Helper of :meth:`sample_qmc`; see its ``given_samples`` parameter. A
+        primary aleatory variable must be given exactly ``N_mcs_ale`` values,
+        since those rows are what :meth:`probabilities_imp` reads; any other
+        variable may be given fewer, leaving the drawn tail untouched.
+        '''
+        by_name = {var.name: var for var in all_vars}
+        vars_ale_prim = {var.name for var in self.vars_ale if var.primary}
+
+        for name, values in given_samples.items():
+            if name not in by_name:
+                raise ValueError(
+                    f"given_samples refers to unknown variable {name!r}; "
+                    f"known variables are {sorted(by_name)}")
+            values = np.asarray(values)
+            if values.ndim != 1:
+                raise ValueError(f'given_samples[{name!r}] must be '
+                                 f'one-dimensional, got shape {values.shape}')
+            n_given = values.shape[0]
+            if name in vars_ale_prim and n_given != N_mcs_ale:
+                raise ValueError(
+                    f'{name!r} is a primary aleatory variable, so it needs '
+                    f'exactly N_mcs_ale={N_mcs_ale} given samples, got {n_given}')
+            if n_given > samples.shape[0]:
+                raise ValueError(
+                    f'given_samples[{name!r}] holds {n_given} values but only '
+                    f'{samples.shape[0]} samples were drawn')
+
+            var = by_name[name]
+            supp = var_supp[name]
+            if np.min(values) < supp[0] or np.max(values) > supp[1]:
+                logger.warning(
+                    'Given samples of %s span [%g, %g], outside the truncated '
+                    'support [%g, %g]; surrogate scaling and the default '
+                    'uniform proposal assume samples lie inside it.',
+                    name, np.min(values), np.max(values), supp[0], supp[1])
+
+            if var.proposal is None:
+                logger.warning(
+                    'Variable %s takes given samples but declares no proposal '
+                    'distribution, so its importance weights still assume '
+                    'uniform sampling over the support. Set %s.proposal to the '
+                    'density the values were actually drawn from.', name, name)
+
+            dtype = getattr(var, 'dtype', None)
+            samples.loc[samples.index[:n_given], name] = \
+                values if dtype is None else values.astype(dtype)
 
     @classmethod
     def from_propagated_samples(cls, vars_epi, inp_samp_prim, out_samp,
@@ -1511,8 +1637,16 @@ class PolyUQ(object):
                 continue
             if var.primary:
                 # assign weight to to all hypercubes
-                # sampling pdf for each value (uniform) = 1 / np.diff(var_supp)
-                p_weights *= np.repeat(var.prob_dens(inp_samp_prim[var.name])[:, np.newaxis] * np.diff(var_supp[var.name]), n_imp_hyc, axis=1)
+                # importance weight = target pdf / sampling (proposal) pdf; the
+                # proposal is uniform over the support unless the variable
+                # declares one (observed rather than drawn samples), see
+                # UncertainVariable._proposal_factor
+                values = inp_samp_prim[var.name]
+                # (1, 1) for the default uniform proposal, (N_mcs_ale, 1) for a
+                # declared one; both broadcast against the (N_mcs_ale, 1) density
+                factor = np.reshape(
+                    var._proposal_factor(values, var_supp[var.name]), (-1, 1))
+                p_weights *= np.repeat(var.prob_dens(values)[:, np.newaxis] * factor, n_imp_hyc, axis=1)
 
         # probabilities are computed for pre-computed stochastic samples as the product of PDFs of the underlying RVs
         # each hypercube may be constructed from different hypervariables (RVs) -> has a different product probability
@@ -1528,9 +1662,11 @@ class PolyUQ(object):
                 if not hyp_var.name in hyp_dens:
                     # caching probability densities if a variable is hypervariable of multiple variables
                     if hyp_var.primary:
-                        hyp_dens[hyp_var.name] = hyp_var.prob_dens(inp_samp_prim[hyp_var.name]) * np.diff(var_supp[hyp_var.name])
+                        hyp_values = inp_samp_prim[hyp_var.name]
                     else:
-                        hyp_dens[hyp_var.name] = hyp_var.prob_dens(inp_suppl_ale[hyp_var.name]) * np.diff(var_supp[hyp_var.name])
+                        hyp_values = inp_suppl_ale[hyp_var.name]
+                    hyp_dens[hyp_var.name] = hyp_var.prob_dens(hyp_values) * \
+                        np.ravel(hyp_var._proposal_factor(hyp_values, var_supp[hyp_var.name]))
                 p_weights[:, i_weight] *= hyp_dens[hyp_var.name]
             # normalize
             # dividing by sum: Normalization constant 1/C
